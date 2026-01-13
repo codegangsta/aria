@@ -12,9 +12,15 @@ type TelegramConfig struct {
 	Token string `yaml:"token"` // Bot token from @BotFather
 }
 
+// ClaudeConfig holds Claude CLI settings
+type ClaudeConfig struct {
+	SkipPermissions bool `yaml:"skip_permissions"` // pass --dangerously-skip-permissions to Claude
+}
+
 // Config holds the Aria configuration
 type Config struct {
 	Telegram  TelegramConfig `yaml:"telegram"`
+	Claude    ClaudeConfig   `yaml:"claude"`
 	Allowlist []int64        `yaml:"allowlist"` // Telegram user IDs allowed to use the bot
 	LogFile   string         `yaml:"log_file"`  // path to log file
 	Debug     bool           `yaml:"debug"`     // enable debug logging

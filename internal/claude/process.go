@@ -45,12 +45,16 @@ type InitEvent struct {
 }
 
 // NewProcess creates and starts a new persistent Claude process
-func NewProcess(claudePath string, chatID int64, debug bool, logger *slog.Logger) (*ClaudeProcess, error) {
+func NewProcess(claudePath string, chatID int64, debug bool, skipPermissions bool, logger *slog.Logger) (*ClaudeProcess, error) {
 	args := []string{
 		"-p",
 		"--verbose",
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
+	}
+
+	if skipPermissions {
+		args = append(args, "--dangerously-skip-permissions")
 	}
 
 	cmd := exec.Command(claudePath, args...)
@@ -165,10 +169,17 @@ type ToolUse struct {
 	Input map[string]interface{}
 }
 
+// InputRequestEvent represents an input_request event from Claude
+type InputRequestEvent struct {
+	Type   string `json:"type"`
+	ToolID string `json:"tool_use_id"`
+}
+
 // ResponseCallbacks holds callbacks for different response types
 type ResponseCallbacks struct {
-	OnMessage func(text string, isFinal bool)
-	OnToolUse func(tool ToolUse)
+	OnMessage      func(text string, isFinal bool)
+	OnToolUse      func(tool ToolUse)
+	OnInputRequest func(toolID string) // Called when Claude needs user input (e.g., AskUserQuestion)
 }
 
 // ReadResponses reads stream-json responses and calls callbacks for assistant text and tool use
@@ -262,6 +273,23 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 				callbacks.OnMessage(lastMessage, true)
 			}
 			return nil
+		}
+
+		// Input request event indicates Claude is waiting for user input (e.g., AskUserQuestion)
+		if event.Type == "input_request" {
+			var inputReq InputRequestEvent
+			if err := json.Unmarshal([]byte(line), &inputReq); err == nil {
+				p.logger.Debug("input_request received, waiting for user input",
+					"chat_id", p.chatID,
+					"tool_id", inputReq.ToolID,
+				)
+				// Flush any pending message (not final, since we're waiting for input)
+				flushBuffer()
+				if callbacks.OnInputRequest != nil {
+					callbacks.OnInputRequest(inputReq.ToolID)
+				}
+				return nil
+			}
 		}
 	}
 

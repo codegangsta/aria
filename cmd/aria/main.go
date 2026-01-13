@@ -55,10 +55,11 @@ func main() {
 	slog.Info("config loaded",
 		"allowlist_count", len(cfg.Allowlist),
 		"debug", cfg.Debug,
+		"skip_permissions", cfg.Claude.SkipPermissions,
 	)
 
 	// Create components
-	manager := claude.NewManager(*claudePath, cfg.Debug, slog.Default())
+	manager := claude.NewManager(*claudePath, cfg.Debug, cfg.Claude.SkipPermissions, slog.Default())
 
 	bot, err := telegram.New(cfg.Telegram.Token, cfg.Allowlist, cfg.Debug, slog.Default())
 	if err != nil {

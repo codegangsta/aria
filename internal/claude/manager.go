@@ -9,20 +9,22 @@ import (
 
 // ProcessManager manages a pool of persistent Claude processes, one per chat
 type ProcessManager struct {
-	claudePath string
-	debug      bool
-	processes  map[int64]*ClaudeProcess
-	mu         sync.RWMutex
-	logger     *slog.Logger
+	claudePath      string
+	debug           bool
+	skipPermissions bool
+	processes       map[int64]*ClaudeProcess
+	mu              sync.RWMutex
+	logger          *slog.Logger
 }
 
 // NewManager creates a new ProcessManager
-func NewManager(claudePath string, debug bool, logger *slog.Logger) *ProcessManager {
+func NewManager(claudePath string, debug bool, skipPermissions bool, logger *slog.Logger) *ProcessManager {
 	return &ProcessManager{
-		claudePath: claudePath,
-		debug:      debug,
-		processes:  make(map[int64]*ClaudeProcess),
-		logger:     logger,
+		claudePath:      claudePath,
+		debug:           debug,
+		skipPermissions: skipPermissions,
+		processes:       make(map[int64]*ClaudeProcess),
+		logger:          logger,
 	}
 }
 
@@ -54,7 +56,7 @@ func (m *ProcessManager) GetOrCreate(chatID int64) (*ClaudeProcess, error) {
 
 	// Create new process
 	m.logger.Info("creating new claude process", "chat_id", chatID)
-	newProc, err := NewProcess(m.claudePath, chatID, m.debug, m.logger)
+	newProc, err := NewProcess(m.claudePath, chatID, m.debug, m.skipPermissions, m.logger)
 	if err != nil {
 		return nil, fmt.Errorf("creating process for chat %d: %w", chatID, err)
 	}
