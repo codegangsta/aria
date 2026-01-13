@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
@@ -17,12 +18,13 @@ type MessageHandler func(ctx context.Context, chatID int64, userID int64, text s
 
 // Bot wraps the Telegram bot functionality
 type Bot struct {
-	bot       *gotgbot.Bot
-	updater   *ext.Updater
-	allowlist map[int64]bool
-	handler   MessageHandler
-	logger    *slog.Logger
-	debug     bool
+	bot                *gotgbot.Bot
+	updater            *ext.Updater
+	allowlist          map[int64]bool
+	handler            MessageHandler
+	logger             *slog.Logger
+	debug              bool
+	commandsRegistered bool
 }
 
 // New creates a new Telegram bot
@@ -196,4 +198,116 @@ func (b *Bot) TypingLoop(chatID int64) func() {
 	}()
 
 	return cancel
+}
+
+// builtinCommands are Claude Code commands not exposed in the init event's slash_commands
+var builtinCommands = []string{
+	"clear",  // Clear conversation history
+	"help",   // Show help
+	"memory", // Edit CLAUDE.md
+}
+
+// RegisterCommands registers slash commands with Telegram's command menu
+// Only registers once per bot lifetime
+func (b *Bot) RegisterCommands(commands []string) {
+	if b.commandsRegistered || len(commands) == 0 {
+		return
+	}
+
+	// Combine discovered commands with known built-in commands
+	allCommands := append(commands, builtinCommands...)
+
+	// Build bot commands with descriptions
+	// Telegram commands must be lowercase, 1-32 chars, only a-z, 0-9, and underscores
+	botCommands := make([]gotgbot.BotCommand, 0, len(allCommands))
+	for _, cmd := range allCommands {
+		// Skip internal commands
+		if cmd == "aria" {
+			continue
+		}
+
+		// Convert hyphens to underscores for Telegram compatibility
+		telegramCmd := strings.ReplaceAll(cmd, "-", "_")
+
+		// Skip if still invalid (contains other special chars)
+		if !isValidTelegramCommand(telegramCmd) {
+			continue
+		}
+
+		botCommands = append(botCommands, gotgbot.BotCommand{
+			Command:     telegramCmd,
+			Description: getCommandDescription(cmd),
+		})
+	}
+
+	if len(botCommands) == 0 {
+		return
+	}
+
+	// Log commands being registered
+	cmdNames := make([]string, len(botCommands))
+	for i, bc := range botCommands {
+		cmdNames[i] = bc.Command
+	}
+	b.logger.Info("attempting to register commands", "commands", cmdNames)
+
+	// Register with Telegram
+	_, err := b.bot.SetMyCommands(botCommands, nil)
+	if err != nil {
+		b.logger.Error("failed to register commands", "error", err, "commands", cmdNames)
+		return
+	}
+
+	b.commandsRegistered = true
+	b.logger.Info("registered telegram commands", "count", len(botCommands))
+}
+
+// isValidTelegramCommand checks if a command name is valid for Telegram
+func isValidTelegramCommand(cmd string) bool {
+	if len(cmd) < 1 || len(cmd) > 32 {
+		return false
+	}
+	for i, c := range cmd {
+		if c >= 'a' && c <= 'z' {
+			continue
+		}
+		if c >= '0' && c <= '9' && i > 0 {
+			continue
+		}
+		if c == '_' && i > 0 {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// getCommandDescription returns a human-readable description for a command
+func getCommandDescription(cmd string) string {
+	descriptions := map[string]string{
+		// Built-in commands
+		"clear":  "Clear conversation history",
+		"help":   "Show available commands",
+		"memory": "Edit CLAUDE.md memory file",
+		// Skills
+		"commit":            "Stage and commit changes",
+		"calendar":          "View and create calendar events",
+		"mail":              "Read and manage email",
+		"gtd-daily-review":  "Morning GTD daily review",
+		"gtd-weekly-review": "Weekly GTD review",
+		"gtd-process-inbox": "Process Things 3 inbox",
+		"gtd-next-action":   "Get next action from Things 3",
+		"gtd-project":       "Work through a Things 3 project",
+		"gtd-clarify":       "Clarify today's tasks",
+		"things3":           "Things 3 task management",
+		"plan-to-project":   "Convert plan to Things 3 project",
+		"reflect":           "Reflect on session",
+		"browser":           "Browser automation",
+		"compact":           "Compact conversation context",
+	}
+
+	if desc, ok := descriptions[cmd]; ok {
+		return desc
+	}
+	return "Claude skill"
 }

@@ -112,3 +112,29 @@ func (m *ProcessManager) ProcessCount() int {
 	defer m.mu.RUnlock()
 	return len(m.processes)
 }
+
+// GetSlashCommands returns slash commands from any active process
+// Returns nil if no processes exist yet
+func (m *ProcessManager) GetSlashCommands() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, proc := range m.processes {
+		if proc.Alive() {
+			return proc.SlashCommands()
+		}
+	}
+	return nil
+}
+
+// Reset kills the Claude process for a chat, forcing a fresh one on next message
+func (m *ProcessManager) Reset(chatID int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if proc, exists := m.processes[chatID]; exists {
+		m.logger.Info("resetting claude process", "chat_id", chatID)
+		proc.Close()
+		delete(m.processes, chatID)
+	}
+}

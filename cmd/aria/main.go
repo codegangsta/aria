@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/codegangsta/aria/internal/claude"
@@ -84,8 +85,29 @@ func main() {
 		stopTyping := bot.TypingLoop(chatID)
 		defer stopTyping()
 
+		// Handle /clear specially - kill the process instead of forwarding to Claude
+		// (Claude's /clear is a CLI command, not a user message)
+		cmd := strings.SplitN(text, " ", 2)[0]
+		cmd = strings.ReplaceAll(cmd, "_", "-")
+		if cmd == "/clear" {
+			slog.Info("clearing conversation", "chat_id", chatID)
+			manager.Reset(chatID)
+			respond("Conversation cleared.")
+			return
+		}
+
+		// Check if this is a silent command that needs special handling
+		isSilent, confirmation := claude.IsSilentCommand(text)
+		if isSilent {
+			slog.Debug("handling silent command", "command", text)
+		}
+
+		// Track if we got any response
+		gotResponse := false
+
 		// Send message via persistent process manager
 		err := manager.Send(msgCtx, chatID, text, func(responseText string) {
+			gotResponse = true
 			slog.Debug("sending response to telegram",
 				"chat_id", chatID,
 				"text_length", len(responseText),
@@ -100,6 +122,18 @@ func main() {
 				"error", err,
 			)
 			respond("Sorry, something went wrong. Please try again.")
+		}
+
+		// For silent commands that didn't produce a response, send confirmation
+		if isSilent && !gotResponse && confirmation != "" {
+			slog.Debug("sending silent command confirmation", "confirmation", confirmation)
+			respond(confirmation)
+		}
+
+		// Register slash commands with Telegram after first successful message
+		// (commands are discovered when Claude process starts)
+		if commands := manager.GetSlashCommands(); commands != nil {
+			bot.RegisterCommands(commands)
 		}
 	})
 

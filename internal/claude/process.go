@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 	"sync"
 )
 
@@ -24,13 +25,21 @@ type UserContent struct {
 
 // ClaudeProcess represents a persistent Claude CLI process
 type ClaudeProcess struct {
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	stdout  io.ReadCloser
-	scanner *bufio.Scanner
-	mu      sync.Mutex
-	chatID  int64
-	debug   bool
+	cmd           *exec.Cmd
+	stdin         io.WriteCloser
+	stdout        io.ReadCloser
+	scanner       *bufio.Scanner
+	mu            sync.Mutex
+	chatID        int64
+	debug         bool
+	slashCommands []string // Commands discovered from init event
+}
+
+// InitEvent represents the system init event from Claude
+type InitEvent struct {
+	Type          string   `json:"type"`
+	Subtype       string   `json:"subtype"`
+	SlashCommands []string `json:"slash_commands"`
 }
 
 // NewProcess creates and starts a new persistent Claude process
@@ -76,13 +85,52 @@ func NewProcess(claudePath string, chatID int64, debug bool) (*ClaudeProcess, er
 	}, nil
 }
 
+// SilentCommand represents a command that doesn't produce assistant output
+type SilentCommand struct {
+	Name         string
+	Confirmation string
+}
+
+// silentCommands are commands that don't produce assistant messages
+// Note: /clear is handled specially in main.go (kills process), not here
+var silentCommands = map[string]SilentCommand{
+	"/compact": {Name: "compact", Confirmation: "Context compacted."},
+	"/help":    {Name: "help", Confirmation: ""}, // help might produce output, check
+}
+
+// IsSilentCommand checks if a message is a silent command and returns its confirmation
+func IsSilentCommand(message string) (bool, string) {
+	// Normalize: convert underscores to hyphens and get just the command part
+	cmd := strings.SplitN(message, " ", 2)[0]
+	cmd = strings.ReplaceAll(cmd, "_", "-")
+
+	if sc, ok := silentCommands[cmd]; ok {
+		return true, sc.Confirmation
+	}
+	return false, ""
+}
+
 // Send writes a user message to Claude's stdin in stream-json format
 func (p *ClaudeProcess) Send(message string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Prepend /aria skill to load iMessage mode
-	prompt := fmt.Sprintf("/aria %s", message)
+	// Determine the prompt to send
+	var prompt string
+	if strings.HasPrefix(message, "/") && !strings.HasPrefix(message, "/aria") {
+		// Forward slash commands directly to Claude (e.g., /commit, /calendar)
+		// Convert underscores to hyphens (Telegram uses underscores, Claude uses hyphens)
+		prompt = convertTelegramCommand(message)
+		if p.debug {
+			fmt.Printf("[DEBUG] Sending command: %s (original: %s)\n", prompt, message)
+		}
+	} else {
+		// Prepend /aria skill to load iMessage mode for regular messages
+		prompt = fmt.Sprintf("/aria %s", message)
+		if p.debug {
+			fmt.Printf("[DEBUG] Sending message with /aria prefix\n")
+		}
+	}
 
 	msg := UserMessage{
 		Type: "user",
@@ -107,6 +155,7 @@ func (p *ClaudeProcess) Send(message string) error {
 
 // ReadResponses reads stream-json responses and calls onMessage for each assistant text
 // This blocks until the current response is complete (receives result event)
+// Also captures slash commands from the init event if not already captured
 func (p *ClaudeProcess) ReadResponses(ctx context.Context, onMessage func(string)) error {
 	for p.scanner.Scan() {
 		select {
@@ -123,6 +172,27 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, onMessage func(string
 			continue
 		}
 
+		// Debug logging for all events
+		if p.debug {
+			fmt.Printf("[DEBUG] Event type=%s\n", event.Type)
+			if len(line) > 200 {
+				fmt.Printf("[DEBUG] Line (truncated): %s...\n", line[:200])
+			} else {
+				fmt.Printf("[DEBUG] Line: %s\n", line)
+			}
+		}
+
+		// Capture slash commands from init event (only once)
+		if event.Type == "system" && p.slashCommands == nil {
+			var initEvent InitEvent
+			if json.Unmarshal([]byte(line), &initEvent) == nil && initEvent.Subtype == "init" {
+				p.slashCommands = initEvent.SlashCommands
+				if p.debug {
+					fmt.Printf("[DEBUG] Captured %d slash commands\n", len(p.slashCommands))
+				}
+			}
+		}
+
 		// Process assistant messages
 		if event.Type == "assistant" {
 			for _, content := range event.Message.Content {
@@ -134,6 +204,9 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, onMessage func(string
 
 		// Result event indicates end of response
 		if event.Type == "result" {
+			if p.debug {
+				fmt.Printf("[DEBUG] Result received, response complete\n")
+			}
 			return nil
 		}
 	}
@@ -152,6 +225,28 @@ func (p *ClaudeProcess) Alive() bool {
 	}
 	// ProcessState is nil if process hasn't exited
 	return p.cmd.ProcessState == nil
+}
+
+// SlashCommands returns the slash commands discovered from the init event
+func (p *ClaudeProcess) SlashCommands() []string {
+	return p.slashCommands
+}
+
+// convertTelegramCommand converts a Telegram command (underscores) to Claude format (hyphens)
+// e.g., "/gtd_daily_review args" -> "/gtd-daily-review args"
+func convertTelegramCommand(message string) string {
+	// Split into command and args
+	parts := strings.SplitN(message, " ", 2)
+	cmd := parts[0]
+
+	// Convert underscores to hyphens in the command part only
+	cmd = strings.ReplaceAll(cmd, "_", "-")
+
+	// Rejoin with args if present
+	if len(parts) > 1 {
+		return cmd + " " + parts[1]
+	}
+	return cmd
 }
 
 // Close gracefully closes the Claude process
