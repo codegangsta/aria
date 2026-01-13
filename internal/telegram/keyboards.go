@@ -108,8 +108,9 @@ func BuildQuestionKeyboard(toolID string, questionIdx int, q Question) (gotgbot.
 		InlineKeyboard: rows,
 	}
 
-	// Format question text with header
-	text := fmt.Sprintf("<b>%s</b>\n%s", esc(q.Header), esc(q.Question))
+	// Format question text with header using MarkdownV2
+	// *text* is bold in MarkdownV2
+	text := fmt.Sprintf("*%s*\n%s", escapeMarkdownV2(q.Header), escapeMarkdownV2(q.Question))
 
 	return keyboard, text
 }

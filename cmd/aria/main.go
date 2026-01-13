@@ -151,9 +151,10 @@ func main() {
 					}
 					pendingMu.Unlock()
 
-					// Send keyboard for each question (typically just one)
-					for i, q := range parsed.Questions {
-						keyboard, text := telegram.BuildQuestionKeyboard(tool.ID, i, q)
+					// Send keyboard for first question only (one at a time for now)
+					if len(parsed.Questions) > 0 {
+						q := parsed.Questions[0]
+						keyboard, text := telegram.BuildQuestionKeyboard(tool.ID, 0, q)
 						if err := bot.SendQuestionKeyboard(chatID, text, keyboard); err != nil {
 							slog.Error("failed to send question keyboard",
 								"chat_id", chatID,
@@ -283,8 +284,10 @@ func main() {
 							Questions: parsed.Questions,
 						}
 						pendingMu.Unlock()
-						for i, q := range parsed.Questions {
-							keyboard, text := telegram.BuildQuestionKeyboard(tool.ID, i, q)
+						// Send first question only (one at a time)
+						if len(parsed.Questions) > 0 {
+							q := parsed.Questions[0]
+							keyboard, text := telegram.BuildQuestionKeyboard(tool.ID, 0, q)
 							bot.SendQuestionKeyboard(chatID, text, keyboard)
 						}
 						return

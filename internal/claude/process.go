@@ -245,7 +245,10 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 					hasMessage = true
 				}
 				if content.Type == "tool_use" && content.Name != "" {
-					// Emit tool use event immediately
+					// Flush any pending text BEFORE emitting tool use
+					// This ensures text appears before tool notifications/keyboards
+					flushBuffer()
+					// Emit tool use event
 					if callbacks.OnToolUse != nil {
 						callbacks.OnToolUse(ToolUse{
 							ID:    content.ID,

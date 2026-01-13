@@ -167,18 +167,19 @@ func (b *Bot) handleMessage(bot *gotgbot.Bot, ctx *ext.Context) error {
 		// Start typing indicator
 		b.startTyping(chatID)
 
-		// respond converts markdown to HTML before sending
+		// respond converts markdown to MarkdownV2 before sending
 		respond := func(text string, silent bool) {
-			formatted := FormatHTML(text)
+			formatted := FormatMarkdownV2(text)
 			opts := &gotgbot.SendMessageOpts{
-				ParseMode:           "HTML",
+				ParseMode:           "MarkdownV2",
 				DisableNotification: silent,
 			}
 			if _, err := bot.SendMessage(chatID, formatted, opts); err != nil {
-				// If HTML parsing fails, fall back to plain text
-				b.logger.Warn("HTML send failed, retrying plain",
+				// If MarkdownV2 parsing fails, fall back to plain text
+				b.logger.Warn("MarkdownV2 send failed, retrying plain",
 					"chat_id", chatID,
 					"error", err,
+					"formatted", formatted,
 				)
 				plainOpts := &gotgbot.SendMessageOpts{
 					DisableNotification: silent,
@@ -192,21 +193,34 @@ func (b *Bot) handleMessage(bot *gotgbot.Bot, ctx *ext.Context) error {
 			}
 		}
 
-		// replyHTML sends pre-formatted HTML as a reply to a specific message
-		replyHTML := func(html string, replyToMsgID int64, silent bool) {
+		// replyMarkdown sends pre-formatted MarkdownV2 as a reply to a specific message
+		replyHTML := func(text string, replyToMsgID int64, silent bool) {
 			opts := &gotgbot.SendMessageOpts{
-				ParseMode:           "HTML",
+				ParseMode:           "MarkdownV2",
 				DisableNotification: silent,
 				ReplyParameters: &gotgbot.ReplyParameters{
 					MessageId: replyToMsgID,
 				},
 			}
-			if _, err := bot.SendMessage(chatID, html, opts); err != nil {
-				b.logger.Warn("HTML reply failed",
+			if _, err := bot.SendMessage(chatID, text, opts); err != nil {
+				b.logger.Warn("MarkdownV2 reply failed, retrying plain",
 					"chat_id", chatID,
 					"reply_to", replyToMsgID,
 					"error", err,
 				)
+				// Fall back to plain text
+				plainOpts := &gotgbot.SendMessageOpts{
+					DisableNotification: silent,
+					ReplyParameters: &gotgbot.ReplyParameters{
+						MessageId: replyToMsgID,
+					},
+				}
+				if _, err := bot.SendMessage(chatID, text, plainOpts); err != nil {
+					b.logger.Error("failed to send reply",
+						"chat_id", chatID,
+						"error", err,
+					)
+				}
 			}
 		}
 
@@ -265,18 +279,18 @@ func (b *Bot) startTyping(chatID int64) {
 	_, _ = b.bot.SendChatAction(chatID, "typing", nil)
 }
 
-// SendMessage sends a text message to a chat with HTML formatting
+// SendMessage sends a text message to a chat with MarkdownV2 formatting
 // silent=true disables notification sound
 func (b *Bot) SendMessage(chatID int64, text string, silent bool) error {
-	formatted := FormatHTML(text)
+	formatted := FormatMarkdownV2(text)
 	opts := &gotgbot.SendMessageOpts{
-		ParseMode:           "HTML",
+		ParseMode:           "MarkdownV2",
 		DisableNotification: silent,
 	}
 	_, err := b.bot.SendMessage(chatID, formatted, opts)
 	if err != nil {
-		// Fall back to plain text if HTML fails
-		b.logger.Warn("HTML send failed, retrying plain", "error", err)
+		// Fall back to plain text if MarkdownV2 fails
+		b.logger.Warn("MarkdownV2 send failed, retrying plain", "error", err, "formatted", formatted)
 		plainOpts := &gotgbot.SendMessageOpts{
 			DisableNotification: silent,
 		}
@@ -288,7 +302,7 @@ func (b *Bot) SendMessage(chatID int64, text string, silent bool) error {
 // SendQuestionKeyboard sends a question with inline keyboard options
 func (b *Bot) SendQuestionKeyboard(chatID int64, text string, keyboard gotgbot.InlineKeyboardMarkup) error {
 	opts := &gotgbot.SendMessageOpts{
-		ParseMode:   "HTML",
+		ParseMode:   "MarkdownV2",
 		ReplyMarkup: keyboard,
 	}
 	_, err := b.bot.SendMessage(chatID, text, opts)

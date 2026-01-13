@@ -2,12 +2,8 @@ package telegram
 
 import (
 	"fmt"
-	htmlpkg "html"
+	"regexp"
 	"strings"
-
-	"github.com/gomarkdown/markdown"
-	"github.com/gomarkdown/markdown/html"
-	"github.com/gomarkdown/markdown/parser"
 )
 
 // ToolUse represents a tool call from Claude for display purposes
@@ -19,14 +15,9 @@ type ToolUse struct {
 
 // toolDisplayConfig defines how to display a specific tool
 type toolDisplayConfig struct {
-	Emoji    string
-	Format   func(input map[string]interface{}) string
-	Verb     string // e.g., "Running", "Reading", "Editing"
-}
-
-// esc escapes HTML entities in a string
-func esc(s string) string {
-	return htmlpkg.EscapeString(s)
+	Emoji  string
+	Format func(input map[string]interface{}) string
+	Verb   string // e.g., "Running", "Reading", "Editing"
 }
 
 // toolDisplays maps tool names to their display configuration
@@ -36,11 +27,10 @@ var toolDisplays = map[string]toolDisplayConfig{
 		Verb:  "Running",
 		Format: func(input map[string]interface{}) string {
 			if cmd, ok := input["command"].(string); ok {
-				// Truncate long commands
 				if len(cmd) > 60 {
 					cmd = cmd[:57] + "..."
 				}
-				return fmt.Sprintf("<code>%s</code>", esc(cmd))
+				return fmt.Sprintf("`%s`", escapeInlineCode(cmd))
 			}
 			return ""
 		},
@@ -50,7 +40,7 @@ var toolDisplays = map[string]toolDisplayConfig{
 		Verb:  "Reading",
 		Format: func(input map[string]interface{}) string {
 			if path, ok := input["file_path"].(string); ok {
-				return esc(shortPath(path))
+				return escapeMarkdownV2(shortPath(path))
 			}
 			return ""
 		},
@@ -60,7 +50,7 @@ var toolDisplays = map[string]toolDisplayConfig{
 		Verb:  "Editing",
 		Format: func(input map[string]interface{}) string {
 			if path, ok := input["file_path"].(string); ok {
-				return esc(shortPath(path))
+				return escapeMarkdownV2(shortPath(path))
 			}
 			return ""
 		},
@@ -70,7 +60,7 @@ var toolDisplays = map[string]toolDisplayConfig{
 		Verb:  "Writing",
 		Format: func(input map[string]interface{}) string {
 			if path, ok := input["file_path"].(string); ok {
-				return esc(shortPath(path))
+				return escapeMarkdownV2(shortPath(path))
 			}
 			return ""
 		},
@@ -83,7 +73,7 @@ var toolDisplays = map[string]toolDisplayConfig{
 				if len(pattern) > 40 {
 					pattern = pattern[:37] + "..."
 				}
-				return fmt.Sprintf("<code>%s</code>", esc(pattern))
+				return fmt.Sprintf("`%s`", escapeInlineCode(pattern))
 			}
 			return ""
 		},
@@ -93,7 +83,7 @@ var toolDisplays = map[string]toolDisplayConfig{
 		Verb:  "Finding",
 		Format: func(input map[string]interface{}) string {
 			if pattern, ok := input["pattern"].(string); ok {
-				return fmt.Sprintf("<code>%s</code>", esc(pattern))
+				return fmt.Sprintf("`%s`", escapeInlineCode(pattern))
 			}
 			return ""
 		},
@@ -103,10 +93,10 @@ var toolDisplays = map[string]toolDisplayConfig{
 		Verb:  "Spawning",
 		Format: func(input map[string]interface{}) string {
 			if desc, ok := input["description"].(string); ok {
-				return esc(desc)
+				return escapeMarkdownV2(desc)
 			}
 			if agentType, ok := input["subagent_type"].(string); ok {
-				return esc(agentType) + " agent"
+				return escapeMarkdownV2(agentType) + " agent"
 			}
 			return "agent"
 		},
@@ -116,13 +106,12 @@ var toolDisplays = map[string]toolDisplayConfig{
 		Verb:  "Fetching",
 		Format: func(input map[string]interface{}) string {
 			if url, ok := input["url"].(string); ok {
-				// Show just domain
 				url = strings.TrimPrefix(url, "https://")
 				url = strings.TrimPrefix(url, "http://")
 				if idx := strings.Index(url, "/"); idx > 0 {
 					url = url[:idx]
 				}
-				return esc(url)
+				return escapeMarkdownV2(url)
 			}
 			return ""
 		},
@@ -135,7 +124,7 @@ var toolDisplays = map[string]toolDisplayConfig{
 				if len(query) > 40 {
 					query = query[:37] + "..."
 				}
-				return fmt.Sprintf(`"%s"`, esc(query))
+				return fmt.Sprintf(`"%s"`, escapeMarkdownV2(query))
 			}
 			return ""
 		},
@@ -148,15 +137,14 @@ var mcpToolDisplays = map[string]toolDisplayConfig{
 		Emoji: "✅",
 		Verb:  "Things",
 		Format: func(input map[string]interface{}) string {
-			// Try to extract meaningful info from common Things operations
 			if title, ok := input["title"].(string); ok {
 				if len(title) > 30 {
 					title = title[:27] + "..."
 				}
-				return esc(title)
+				return escapeMarkdownV2(title)
 			}
 			if query, ok := input["query"].(string); ok {
-				return fmt.Sprintf(`"%s"`, esc(query))
+				return fmt.Sprintf(`"%s"`, escapeMarkdownV2(query))
 			}
 			return ""
 		},
@@ -171,10 +159,10 @@ var mcpToolDisplays = map[string]toolDisplayConfig{
 				if idx := strings.Index(url, "/"); idx > 0 {
 					url = url[:idx]
 				}
-				return esc(url)
+				return escapeMarkdownV2(url)
 			}
 			if action, ok := input["action"].(string); ok {
-				return esc(action)
+				return escapeMarkdownV2(action)
 			}
 			return ""
 		},
@@ -190,15 +178,14 @@ func FormatToolNotification(tool ToolUse) string {
 			detail = cfg.Format(tool.Input)
 		}
 		if detail != "" {
-			return fmt.Sprintf("%s %s %s", cfg.Emoji, cfg.Verb, detail)
+			return fmt.Sprintf("%s %s %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb), detail)
 		}
-		return fmt.Sprintf("%s %s", cfg.Emoji, cfg.Verb)
+		return fmt.Sprintf("%s %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb))
 	}
 
 	// Check for MCP tool prefixes
 	for prefix, cfg := range mcpToolDisplays {
 		if strings.HasPrefix(tool.Name, prefix) {
-			// Extract the operation name after the prefix
 			operation := strings.TrimPrefix(tool.Name, prefix)
 			operation = strings.ReplaceAll(operation, "_", " ")
 
@@ -207,14 +194,14 @@ func FormatToolNotification(tool ToolUse) string {
 				detail = cfg.Format(tool.Input)
 			}
 			if detail != "" {
-				return fmt.Sprintf("%s %s: %s %s", cfg.Emoji, cfg.Verb, operation, detail)
+				return fmt.Sprintf("%s %s: %s %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb), escapeMarkdownV2(operation), detail)
 			}
-			return fmt.Sprintf("%s %s: %s", cfg.Emoji, cfg.Verb, operation)
+			return fmt.Sprintf("%s %s: %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb), escapeMarkdownV2(operation))
 		}
 	}
 
 	// Fallback for unknown tools
-	return fmt.Sprintf("⚙️ %s", tool.Name)
+	return fmt.Sprintf("⚙️ %s", escapeMarkdownV2(tool.Name))
 }
 
 // shortPath returns just the filename from a path
@@ -225,22 +212,157 @@ func shortPath(path string) string {
 	return path
 }
 
-// FormatHTML converts markdown text to Telegram-compatible HTML.
-// Telegram supports a subset of HTML: <b>, <i>, <code>, <pre>, <a>.
-func FormatHTML(text string) string {
-	// Create parser with common extensions
-	extensions := parser.CommonExtensions | parser.AutoHeadingIDs
-	p := parser.NewWithExtensions(extensions)
+// MarkdownV2 special characters that need escaping
+const markdownV2SpecialChars = `_*[]()~` + "`" + `>#+-=|{}.!`
 
-	// Create HTML renderer configured for Telegram's subset
-	opts := html.RendererOptions{
-		Flags: html.CommonFlags | html.SkipHTML,
+// escapeMarkdownV2 escapes special characters for Telegram MarkdownV2
+func escapeMarkdownV2(text string) string {
+	var result strings.Builder
+	for _, r := range text {
+		if strings.ContainsRune(markdownV2SpecialChars, r) {
+			result.WriteRune('\\')
+		}
+		result.WriteRune(r)
 	}
-	renderer := html.NewRenderer(opts)
+	return result.String()
+}
 
-	// Convert markdown to HTML
-	doc := p.Parse([]byte(text))
-	output := markdown.Render(doc, renderer)
+// escapeInlineCode escapes characters inside inline code (only ` and \)
+func escapeInlineCode(text string) string {
+	text = strings.ReplaceAll(text, "\\", "\\\\")
+	text = strings.ReplaceAll(text, "`", "\\`")
+	return text
+}
 
-	return string(output)
+// escapeCodeBlock escapes characters inside code blocks
+func escapeCodeBlock(text string) string {
+	text = strings.ReplaceAll(text, "\\", "\\\\")
+	text = strings.ReplaceAll(text, "`", "\\`")
+	return text
+}
+
+// Regex patterns for markdown elements
+var (
+	codeBlockRegex  = regexp.MustCompile("(?s)```([a-zA-Z]*)\\n?(.*?)```")
+	inlineCodeRegex = regexp.MustCompile("`([^`]+)`")
+	linkRegex       = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
+	boldRegex       = regexp.MustCompile(`\*\*(.+?)\*\*`)
+	italicRegex     = regexp.MustCompile(`(?:^|[^*])\*([^*]+)\*(?:[^*]|$)`)
+	underscoreItalicRegex = regexp.MustCompile(`_(.+?)_`)
+	strikethroughRegex    = regexp.MustCompile(`~~(.+?)~~`)
+)
+
+// placeholder represents a protected element
+type placeholder struct {
+	key     string
+	content string
+}
+
+// FormatMarkdownV2 converts standard markdown to Telegram MarkdownV2 format
+func FormatMarkdownV2(text string) string {
+	placeholders := make(map[string]string)
+	counter := 0
+
+	// Step 1: Extract and protect code blocks
+	text = codeBlockRegex.ReplaceAllStringFunc(text, func(match string) string {
+		key := fmt.Sprintf("\x00CODEBLOCK%d\x00", counter)
+		counter++
+
+		parts := codeBlockRegex.FindStringSubmatch(match)
+		lang := ""
+		code := match
+		if len(parts) >= 3 {
+			lang = parts[1]
+			code = parts[2]
+		}
+
+		// Format as MarkdownV2 code block
+		escaped := escapeCodeBlock(code)
+		if lang != "" {
+			placeholders[key] = fmt.Sprintf("```%s\n%s```", lang, escaped)
+		} else {
+			placeholders[key] = fmt.Sprintf("```\n%s```", escaped)
+		}
+		return key
+	})
+
+	// Step 2: Extract and protect inline code
+	text = inlineCodeRegex.ReplaceAllStringFunc(text, func(match string) string {
+		key := fmt.Sprintf("\x00INLINECODE%d\x00", counter)
+		counter++
+
+		parts := inlineCodeRegex.FindStringSubmatch(match)
+		if len(parts) >= 2 {
+			escaped := escapeInlineCode(parts[1])
+			placeholders[key] = fmt.Sprintf("`%s`", escaped)
+		} else {
+			placeholders[key] = match
+		}
+		return key
+	})
+
+	// Step 3: Extract and protect links
+	text = linkRegex.ReplaceAllStringFunc(text, func(match string) string {
+		key := fmt.Sprintf("\x00LINK%d\x00", counter)
+		counter++
+
+		parts := linkRegex.FindStringSubmatch(match)
+		if len(parts) >= 3 {
+			linkText := escapeMarkdownV2(parts[1])
+			linkURL := parts[2]
+			// URLs in links need special escaping: only ) and \
+			linkURL = strings.ReplaceAll(linkURL, "\\", "\\\\")
+			linkURL = strings.ReplaceAll(linkURL, ")", "\\)")
+			placeholders[key] = fmt.Sprintf("[%s](%s)", linkText, linkURL)
+		} else {
+			placeholders[key] = match
+		}
+		return key
+	})
+
+	// Step 4: Convert bold **text** to *text*
+	text = boldRegex.ReplaceAllStringFunc(text, func(match string) string {
+		key := fmt.Sprintf("\x00BOLD%d\x00", counter)
+		counter++
+
+		parts := boldRegex.FindStringSubmatch(match)
+		if len(parts) >= 2 {
+			inner := escapeMarkdownV2(parts[1])
+			placeholders[key] = fmt.Sprintf("*%s*", inner)
+		} else {
+			placeholders[key] = match
+		}
+		return key
+	})
+
+	// Step 5: Convert strikethrough ~~text~~ to ~text~
+	text = strikethroughRegex.ReplaceAllStringFunc(text, func(match string) string {
+		key := fmt.Sprintf("\x00STRIKE%d\x00", counter)
+		counter++
+
+		parts := strikethroughRegex.FindStringSubmatch(match)
+		if len(parts) >= 2 {
+			inner := escapeMarkdownV2(parts[1])
+			placeholders[key] = fmt.Sprintf("~%s~", inner)
+		} else {
+			placeholders[key] = match
+		}
+		return key
+	})
+
+	// Step 6: Escape remaining special characters in plain text
+	text = escapeMarkdownV2(text)
+
+	// Step 7: Restore all placeholders
+	for key, value := range placeholders {
+		text = strings.ReplaceAll(text, escapeMarkdownV2(key), value)
+	}
+
+	return strings.TrimSpace(text)
+}
+
+// FormatHTML is kept for backward compatibility but now just escapes for plain text
+// Deprecated: Use FormatMarkdownV2 instead
+func FormatHTML(text string) string {
+	return FormatMarkdownV2(text)
 }
