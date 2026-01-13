@@ -1,0 +1,143 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/codegangsta/aria/internal/claude"
+	"github.com/codegangsta/aria/internal/config"
+	"github.com/codegangsta/aria/internal/telegram"
+)
+
+func main() {
+	configPath := flag.String("config", "", "path to config file")
+	claudePath := flag.String("claude", "claude", "path to claude binary")
+	flag.Parse()
+
+	// Find default paths
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to get home directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *configPath == "" {
+		*configPath = homeDir + "/.config/aria/config.yaml"
+	}
+
+	fmt.Println("Aria starting...")
+	fmt.Printf("Config: %s\n", *configPath)
+	fmt.Printf("Claude: %s\n", *claudePath)
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Set up structured logging
+	setupLogger(cfg)
+
+	slog.Info("config loaded",
+		"allowlist_count", len(cfg.Allowlist),
+		"debug", cfg.Debug,
+	)
+
+	// Create components
+	manager := claude.NewManager(*claudePath, cfg.Debug, slog.Default())
+
+	bot, err := telegram.New(cfg.Telegram.Token, cfg.Allowlist, cfg.Debug, slog.Default())
+	if err != nil {
+		slog.Error("failed to create telegram bot", "error", err)
+		os.Exit(1)
+	}
+
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle shutdown signals
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigChan
+		slog.Info("shutdown signal received", "signal", sig.String())
+		manager.Shutdown()
+		cancel()
+	}()
+
+	// Set up message handler
+	bot.SetHandler(func(msgCtx context.Context, chatID int64, userID int64, text string, respond func(string)) {
+		slog.Info("processing message",
+			"chat_id", chatID,
+			"user_id", userID,
+			"text_length", len(text),
+		)
+
+		// Start typing indicator loop
+		stopTyping := bot.TypingLoop(chatID)
+		defer stopTyping()
+
+		// Send message via persistent process manager
+		err := manager.Send(msgCtx, chatID, text, func(responseText string) {
+			slog.Debug("sending response to telegram",
+				"chat_id", chatID,
+				"text_length", len(responseText),
+			)
+			respond(responseText)
+			slog.Debug("response sent")
+		})
+
+		if err != nil {
+			slog.Error("claude error",
+				"chat_id", chatID,
+				"error", err,
+			)
+			respond("Sorry, something went wrong. Please try again.")
+		}
+	})
+
+	slog.Info("aria started, connecting to telegram")
+
+	// Start the bot (blocks until context is cancelled)
+	if err := bot.Start(ctx); err != nil {
+		if ctx.Err() == context.Canceled {
+			slog.Info("aria stopped")
+			return
+		}
+		slog.Error("telegram bot error", "error", err)
+		os.Exit(1)
+	}
+}
+
+// setupLogger configures slog based on config settings
+func setupLogger(cfg *config.Config) {
+	var level slog.Level
+	if cfg.Debug {
+		level = slog.LevelDebug
+	} else {
+		level = slog.LevelInfo
+	}
+
+	// Determine output destination
+	var w io.Writer = os.Stdout
+	if cfg.LogFile != "" {
+		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to open log file: %v\n", err)
+			os.Exit(1)
+		}
+		// Write to both stdout and file
+		w = io.MultiWriter(os.Stdout, f)
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+	handler := slog.NewTextHandler(w, opts)
+	slog.SetDefault(slog.New(handler))
+}

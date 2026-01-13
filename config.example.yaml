@@ -1,0 +1,18 @@
+# Aria Configuration
+
+# Telegram bot settings
+telegram:
+  # Bot token from @BotFather
+  token: "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+
+# Allowlist of Telegram user IDs that can use the bot
+# Get your user ID by messaging @userinfobot on Telegram
+allowlist:
+  - 123456789
+  - 987654321
+
+# Path to log file (optional)
+log_file: "/tmp/aria.log"
+
+# Enable debug logging (optional)
+debug: false

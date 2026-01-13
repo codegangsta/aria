@@ -1,0 +1,16 @@
+# Binaries
+/aria
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Config with secrets
+config.yaml
