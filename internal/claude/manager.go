@@ -54,7 +54,7 @@ func (m *ProcessManager) GetOrCreate(chatID int64) (*ClaudeProcess, error) {
 
 	// Create new process
 	m.logger.Info("creating new claude process", "chat_id", chatID)
-	newProc, err := NewProcess(m.claudePath, chatID, m.debug)
+	newProc, err := NewProcess(m.claudePath, chatID, m.debug, m.logger)
 	if err != nil {
 		return nil, fmt.Errorf("creating process for chat %d: %w", chatID, err)
 	}
@@ -64,7 +64,8 @@ func (m *ProcessManager) GetOrCreate(chatID int64) (*ClaudeProcess, error) {
 }
 
 // Send sends a message to the Claude process for a chat and reads the responses
-func (m *ProcessManager) Send(ctx context.Context, chatID int64, message string, onResponse func(string)) error {
+// The callbacks struct contains handlers for text messages and tool use events
+func (m *ProcessManager) Send(ctx context.Context, chatID int64, message string, callbacks ResponseCallbacks) error {
 	proc, err := m.GetOrCreate(chatID)
 	if err != nil {
 		return err
@@ -80,7 +81,7 @@ func (m *ProcessManager) Send(ctx context.Context, chatID int64, message string,
 	}
 
 	// Read responses
-	if err := proc.ReadResponses(ctx, onResponse); err != nil {
+	if err := proc.ReadResponses(ctx, callbacks); err != nil {
 		// Process may have died
 		m.mu.Lock()
 		delete(m.processes, chatID)

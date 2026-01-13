@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os/exec"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ type ClaudeProcess struct {
 	mu            sync.Mutex
 	chatID        int64
 	debug         bool
+	logger        *slog.Logger
 	slashCommands []string // Commands discovered from init event
 }
 
@@ -43,7 +45,7 @@ type InitEvent struct {
 }
 
 // NewProcess creates and starts a new persistent Claude process
-func NewProcess(claudePath string, chatID int64, debug bool) (*ClaudeProcess, error) {
+func NewProcess(claudePath string, chatID int64, debug bool, logger *slog.Logger) (*ClaudeProcess, error) {
 	args := []string{
 		"-p",
 		"--verbose",
@@ -82,6 +84,7 @@ func NewProcess(claudePath string, chatID int64, debug bool) (*ClaudeProcess, er
 		scanner: scanner,
 		chatID:  chatID,
 		debug:   debug,
+		logger:  logger,
 	}, nil
 }
 
@@ -121,15 +124,17 @@ func (p *ClaudeProcess) Send(message string) error {
 		// Forward slash commands directly to Claude (e.g., /commit, /calendar)
 		// Convert underscores to hyphens (Telegram uses underscores, Claude uses hyphens)
 		prompt = convertTelegramCommand(message)
-		if p.debug {
-			fmt.Printf("[DEBUG] Sending command: %s (original: %s)\n", prompt, message)
-		}
+		p.logger.Debug("sending command",
+			"prompt", prompt,
+			"original", message,
+			"chat_id", p.chatID,
+		)
 	} else {
 		// Prepend /aria skill to load iMessage mode for regular messages
 		prompt = fmt.Sprintf("/aria %s", message)
-		if p.debug {
-			fmt.Printf("[DEBUG] Sending message with /aria prefix\n")
-		}
+		p.logger.Debug("sending message with /aria prefix",
+			"chat_id", p.chatID,
+		)
 	}
 
 	msg := UserMessage{
@@ -153,10 +158,37 @@ func (p *ClaudeProcess) Send(message string) error {
 	return nil
 }
 
-// ReadResponses reads stream-json responses and calls onMessage for each assistant text
+// ToolUse represents a tool call from Claude
+type ToolUse struct {
+	ID    string
+	Name  string
+	Input map[string]interface{}
+}
+
+// ResponseCallbacks holds callbacks for different response types
+type ResponseCallbacks struct {
+	OnMessage func(text string, isFinal bool)
+	OnToolUse func(tool ToolUse)
+}
+
+// ReadResponses reads stream-json responses and calls callbacks for assistant text and tool use
 // This blocks until the current response is complete (receives result event)
 // Also captures slash commands from the init event if not already captured
-func (p *ClaudeProcess) ReadResponses(ctx context.Context, onMessage func(string)) error {
+// The isFinal parameter indicates whether this is the last message before the result
+func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCallbacks) error {
+	// Buffer to hold the last message so we can mark it as final
+	var lastMessage string
+	var hasMessage bool
+
+	// Helper to flush the buffered message (not final)
+	flushBuffer := func() {
+		if hasMessage && callbacks.OnMessage != nil {
+			callbacks.OnMessage(lastMessage, false)
+			hasMessage = false
+			lastMessage = ""
+		}
+	}
+
 	for p.scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -172,24 +204,22 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, onMessage func(string
 			continue
 		}
 
-		// Debug logging for all events
-		if p.debug {
-			fmt.Printf("[DEBUG] Event type=%s\n", event.Type)
-			if len(line) > 200 {
-				fmt.Printf("[DEBUG] Line (truncated): %s...\n", line[:200])
-			} else {
-				fmt.Printf("[DEBUG] Line: %s\n", line)
-			}
-		}
+		// Log all JSON events from Claude for debugging and future feature development
+		p.logger.Debug("claude event",
+			"type", event.Type,
+			"chat_id", p.chatID,
+			"json", line,
+		)
 
 		// Capture slash commands from init event (only once)
 		if event.Type == "system" && p.slashCommands == nil {
 			var initEvent InitEvent
 			if json.Unmarshal([]byte(line), &initEvent) == nil && initEvent.Subtype == "init" {
 				p.slashCommands = initEvent.SlashCommands
-				if p.debug {
-					fmt.Printf("[DEBUG] Captured %d slash commands\n", len(p.slashCommands))
-				}
+				p.logger.Debug("captured slash commands",
+					"count", len(p.slashCommands),
+					"commands", p.slashCommands,
+				)
 			}
 		}
 
@@ -197,15 +227,39 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, onMessage func(string
 		if event.Type == "assistant" {
 			for _, content := range event.Message.Content {
 				if content.Type == "text" && content.Text != "" {
-					onMessage(content.Text)
+					// Flush previous message (it wasn't final)
+					flushBuffer()
+					// Buffer this message (might be final)
+					lastMessage = content.Text
+					hasMessage = true
+				}
+				if content.Type == "tool_use" && content.Name != "" {
+					// Emit tool use event immediately
+					if callbacks.OnToolUse != nil {
+						callbacks.OnToolUse(ToolUse{
+							ID:    content.ID,
+							Name:  content.Name,
+							Input: content.Input,
+						})
+					}
+					p.logger.Debug("tool use",
+						"tool", content.Name,
+						"id", content.ID,
+						"chat_id", p.chatID,
+					)
 				}
 			}
 		}
 
 		// Result event indicates end of response
 		if event.Type == "result" {
-			if p.debug {
-				fmt.Printf("[DEBUG] Result received, response complete\n")
+			p.logger.Debug("result received, response complete",
+				"chat_id", p.chatID,
+				"has_final_message", hasMessage,
+			)
+			// Send the last buffered message as final
+			if hasMessage && callbacks.OnMessage != nil {
+				callbacks.OnMessage(lastMessage, true)
 			}
 			return nil
 		}

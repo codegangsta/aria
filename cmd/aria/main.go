@@ -74,7 +74,7 @@ func main() {
 	}()
 
 	// Set up message handler
-	bot.SetHandler(func(msgCtx context.Context, chatID int64, userID int64, text string, respond func(string)) {
+	bot.SetHandler(func(msgCtx context.Context, chatID int64, userID int64, text string, respond func(string, bool)) {
 		slog.Info("processing message",
 			"chat_id", chatID,
 			"user_id", userID,
@@ -92,28 +92,62 @@ func main() {
 		if cmd == "/clear" {
 			slog.Info("clearing conversation", "chat_id", chatID)
 			manager.Reset(chatID)
-			respond("Conversation cleared.")
+			respond("Conversation cleared.", false) // Play sound for clear confirmation
 			return
 		}
 
 		// Check if this is a silent command that needs special handling
-		isSilent, confirmation := claude.IsSilentCommand(text)
-		if isSilent {
+		isSilentCmd, confirmation := claude.IsSilentCommand(text)
+		if isSilentCmd {
 			slog.Debug("handling silent command", "command", text)
 		}
 
 		// Track if we got any response
 		gotResponse := false
 
+		// Collect tool calls to send as grouped summary
+		var toolCalls []telegram.ToolUse
+
 		// Send message via persistent process manager
-		err := manager.Send(msgCtx, chatID, text, func(responseText string) {
-			gotResponse = true
-			slog.Debug("sending response to telegram",
-				"chat_id", chatID,
-				"text_length", len(responseText),
-			)
-			respond(responseText)
-			slog.Debug("response sent")
+		// isFinal=true means it's the last message, so we play a sound
+		// isFinal=false means intermediate message, send silently
+		err := manager.Send(msgCtx, chatID, text, claude.ResponseCallbacks{
+			OnMessage: func(responseText string, isFinal bool) {
+				gotResponse = true
+
+				// Send tool summary before final response
+				if isFinal && len(toolCalls) > 0 {
+					summary := telegram.FormatToolSummary(toolCalls)
+					slog.Debug("sending tool summary",
+						"chat_id", chatID,
+						"tool_count", len(toolCalls),
+					)
+					respond(summary, true) // Silent for tool summary
+				}
+
+				silent := !isFinal // Silent for intermediate messages, sound for final
+				slog.Debug("sending response to telegram",
+					"chat_id", chatID,
+					"text_length", len(responseText),
+					"is_final", isFinal,
+					"silent", silent,
+				)
+				respond(responseText, silent)
+				slog.Debug("response sent")
+			},
+			OnToolUse: func(tool claude.ToolUse) {
+				// Collect tool calls for grouped summary
+				toolCalls = append(toolCalls, telegram.ToolUse{
+					ID:    tool.ID,
+					Name:  tool.Name,
+					Input: tool.Input,
+				})
+				slog.Debug("tool use collected",
+					"chat_id", chatID,
+					"tool", tool.Name,
+					"total_tools", len(toolCalls),
+				)
+			},
 		})
 
 		if err != nil {
@@ -121,13 +155,13 @@ func main() {
 				"chat_id", chatID,
 				"error", err,
 			)
-			respond("Sorry, something went wrong. Please try again.")
+			respond("Sorry, something went wrong. Please try again.", false) // Play sound for errors
 		}
 
 		// For silent commands that didn't produce a response, send confirmation
-		if isSilent && !gotResponse && confirmation != "" {
+		if isSilentCmd && !gotResponse && confirmation != "" {
 			slog.Debug("sending silent command confirmation", "confirmation", confirmation)
-			respond(confirmation)
+			respond(confirmation, false) // Play sound for confirmations
 		}
 
 		// Register slash commands with Telegram after first successful message

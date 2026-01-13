@@ -14,7 +14,8 @@ import (
 )
 
 // MessageHandler is called when a message is received from an allowed user
-type MessageHandler func(ctx context.Context, chatID int64, userID int64, text string, respond func(string))
+// The respond callback takes text and a silent flag (silent=true disables notification sound)
+type MessageHandler func(ctx context.Context, chatID int64, userID int64, text string, respond func(text string, silent bool))
 
 // Bot wraps the Telegram bot functionality
 type Bot struct {
@@ -147,13 +148,29 @@ func (b *Bot) handleMessage(bot *gotgbot.Bot, ctx *ext.Context) error {
 		// Start typing indicator
 		b.startTyping(chatID)
 
-		// Create respond function that sends messages back
-		respond := func(text string) {
-			if _, err := bot.SendMessage(chatID, text, nil); err != nil {
-				b.logger.Error("failed to send message",
+		// Create respond function that sends messages back with markdown formatting
+		// silent=true disables notification sound (for intermediate messages)
+		respond := func(text string, silent bool) {
+			formatted := FormatHTML(text)
+			opts := &gotgbot.SendMessageOpts{
+				ParseMode:           "HTML",
+				DisableNotification: silent,
+			}
+			if _, err := bot.SendMessage(chatID, formatted, opts); err != nil {
+				// If HTML parsing fails, fall back to plain text
+				b.logger.Warn("HTML send failed, retrying plain",
 					"chat_id", chatID,
 					"error", err,
 				)
+				plainOpts := &gotgbot.SendMessageOpts{
+					DisableNotification: silent,
+				}
+				if _, err := bot.SendMessage(chatID, text, plainOpts); err != nil {
+					b.logger.Error("failed to send message",
+						"chat_id", chatID,
+						"error", err,
+					)
+				}
 			}
 		}
 
@@ -169,9 +186,23 @@ func (b *Bot) startTyping(chatID int64) {
 	_, _ = b.bot.SendChatAction(chatID, "typing", nil)
 }
 
-// SendMessage sends a text message to a chat
-func (b *Bot) SendMessage(chatID int64, text string) error {
-	_, err := b.bot.SendMessage(chatID, text, nil)
+// SendMessage sends a text message to a chat with HTML formatting
+// silent=true disables notification sound
+func (b *Bot) SendMessage(chatID int64, text string, silent bool) error {
+	formatted := FormatHTML(text)
+	opts := &gotgbot.SendMessageOpts{
+		ParseMode:           "HTML",
+		DisableNotification: silent,
+	}
+	_, err := b.bot.SendMessage(chatID, formatted, opts)
+	if err != nil {
+		// Fall back to plain text if HTML fails
+		b.logger.Warn("HTML send failed, retrying plain", "error", err)
+		plainOpts := &gotgbot.SendMessageOpts{
+			DisableNotification: silent,
+		}
+		_, err = b.bot.SendMessage(chatID, text, plainOpts)
+	}
 	return err
 }
 

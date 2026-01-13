@@ -14,9 +14,13 @@ import (
 const DefaultTimeout = 5 * time.Minute
 
 // ContentBlock represents a content block in a Claude message
+// Can be either "text" or "tool_use" type
 type ContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Type  string                 `json:"type"`
+	Text  string                 `json:"text,omitempty"`
+	ID    string                 `json:"id,omitempty"`    // tool_use: unique ID
+	Name  string                 `json:"name,omitempty"`  // tool_use: tool name
+	Input map[string]interface{} `json:"input,omitempty"` // tool_use: parameters
 }
 
 // MessageContent represents the message in an assistant event
