@@ -12,9 +12,11 @@ func TestLoad(t *testing.T) {
 	configPath := filepath.Join(dir, "config.yaml")
 
 	content := `
+telegram:
+  token: "test-bot-token"
 allowlist:
-  - "+15551234567"
-  - "test@example.com"
+  - 123456789
+  - 987654321
 log_file: "/tmp/test.log"
 debug: true
 `
@@ -31,8 +33,12 @@ debug: true
 		t.Errorf("Allowlist length = %d, want 2", len(cfg.Allowlist))
 	}
 
-	if cfg.Allowlist[0] != "+15551234567" {
-		t.Errorf("Allowlist[0] = %q, want %q", cfg.Allowlist[0], "+15551234567")
+	if cfg.Allowlist[0] != 123456789 {
+		t.Errorf("Allowlist[0] = %d, want %d", cfg.Allowlist[0], 123456789)
+	}
+
+	if cfg.Telegram.Token != "test-bot-token" {
+		t.Errorf("Telegram.Token = %q, want %q", cfg.Telegram.Token, "test-bot-token")
 	}
 
 	if cfg.LogFile != "/tmp/test.log" {
@@ -49,6 +55,8 @@ func TestLoadEmptyAllowlist(t *testing.T) {
 	configPath := filepath.Join(dir, "config.yaml")
 
 	content := `
+telegram:
+  token: "test-bot-token"
 allowlist: []
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
@@ -61,6 +69,24 @@ allowlist: []
 	}
 }
 
+func TestLoadMissingToken(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	content := `
+allowlist:
+  - 123456789
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(configPath)
+	if err == nil {
+		t.Error("Load() should error on missing telegram token")
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	_, err := Load("/nonexistent/config.yaml")
 	if err == nil {
@@ -70,37 +96,24 @@ func TestLoadMissingFile(t *testing.T) {
 
 func TestIsAllowed(t *testing.T) {
 	cfg := &Config{
-		Allowlist: []string{"+15551234567", "test@example.com"},
+		Allowlist: []int64{123456789, 987654321},
 	}
 
 	tests := []struct {
-		sender string
+		name   string
+		userID int64
 		want   bool
 	}{
-		// Exact matches
-		{"+15551234567", true},
-		{"test@example.com", true},
-		{"+15559999999", false},
-		{"other@example.com", false},
-		{"", false},
-
-		// Phone number normalization
-		{"+1 555 123 4567", true},      // spaces
-		{"+1-555-123-4567", true},      // dashes
-		{"+1 (555) 123-4567", true},    // parentheses
-		{"+1.555.123.4567", true},      // dots
-		{"15551234567", false},         // without + (different from +15551234567)
-
-		// Email case-insensitivity
-		{"TEST@example.com", true},
-		{"Test@Example.COM", true},
-		{"TEST@EXAMPLE.COM", true},
+		{"allowed user 1", 123456789, true},
+		{"allowed user 2", 987654321, true},
+		{"not allowed", 111111111, false},
+		{"zero", 0, false},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.sender, func(t *testing.T) {
-			if got := cfg.IsAllowed(tt.sender); got != tt.want {
-				t.Errorf("IsAllowed(%q) = %v, want %v", tt.sender, got, tt.want)
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cfg.IsAllowed(tt.userID); got != tt.want {
+				t.Errorf("IsAllowed(%d) = %v, want %v", tt.userID, got, tt.want)
 			}
 		})
 	}

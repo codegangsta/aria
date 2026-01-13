@@ -9,12 +9,19 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/codegangsta/aria/internal/claude"
 	"github.com/codegangsta/aria/internal/config"
 	"github.com/codegangsta/aria/internal/telegram"
 )
+
+// PendingQuestion stores context for an AskUserQuestion waiting for user input
+type PendingQuestion struct {
+	ToolID    string
+	Questions []telegram.Question
+}
 
 func main() {
 	configPath := flag.String("config", "", "path to config file")
@@ -58,6 +65,10 @@ func main() {
 		slog.Error("failed to create telegram bot", "error", err)
 		os.Exit(1)
 	}
+
+	// Pending questions waiting for user input (chatID -> PendingQuestion)
+	pendingQuestions := make(map[int64]*PendingQuestion)
+	var pendingMu sync.RWMutex
 
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -123,6 +134,41 @@ func main() {
 				slog.Debug("response sent")
 			},
 			OnToolUse: func(tool claude.ToolUse) {
+				// Handle AskUserQuestion specially - send inline keyboard
+				if tool.Name == "AskUserQuestion" {
+					parsed, err := telegram.ParseAskUserQuestion(tool.Input)
+					if err != nil {
+						slog.Error("failed to parse AskUserQuestion", "error", err)
+						return
+					}
+
+					// Store pending question for this chat
+					pendingMu.Lock()
+					pendingQuestions[chatID] = &PendingQuestion{
+						ToolID:    tool.ID,
+						Questions: parsed.Questions,
+					}
+					pendingMu.Unlock()
+
+					// Send keyboard for each question (typically just one)
+					for i, q := range parsed.Questions {
+						keyboard, text := telegram.BuildQuestionKeyboard(tool.ID, i, q)
+						if err := bot.SendQuestionKeyboard(chatID, text, keyboard); err != nil {
+							slog.Error("failed to send question keyboard",
+								"chat_id", chatID,
+								"error", err,
+							)
+						}
+					}
+
+					slog.Debug("sent AskUserQuestion keyboard",
+						"chat_id", chatID,
+						"tool_id", tool.ID,
+						"question_count", len(parsed.Questions),
+					)
+					return
+				}
+
 				// Format and send tool notification as reply to user's message
 				notification := telegram.FormatToolNotification(telegram.ToolUse{
 					ID:    tool.ID,
@@ -157,6 +203,106 @@ func main() {
 		if commands := manager.GetSlashCommands(); commands != nil {
 			bot.RegisterCommands(commands)
 		}
+	})
+
+	// Set up callback handler for inline keyboard button presses
+	bot.SetCallbackHandler(func(cbCtx context.Context, chatID int64, userID int64, data string) string {
+		cb, err := telegram.ParseCallbackData(data)
+		if err != nil {
+			slog.Error("failed to parse callback data", "error", err, "data", data)
+			return "Error processing selection"
+		}
+
+		// Get the pending question for this chat
+		pendingMu.RLock()
+		pending := pendingQuestions[chatID]
+		pendingMu.RUnlock()
+
+		if pending == nil {
+			slog.Warn("no pending question for chat", "chat_id", chatID)
+			return "Question expired"
+		}
+
+		// Handle "Other" selection - prompt for custom text input
+		if cb.Type == "o" {
+			slog.Debug("user selected Other option",
+				"chat_id", chatID,
+				"question_idx", cb.QuestionIdx,
+			)
+			// Clear pending question - they'll type a custom response
+			pendingMu.Lock()
+			delete(pendingQuestions, chatID)
+			pendingMu.Unlock()
+			return "Type your answer and send it"
+		}
+
+		// Get the selected option
+		if cb.QuestionIdx >= len(pending.Questions) {
+			return "Invalid question"
+		}
+		q := pending.Questions[cb.QuestionIdx]
+		if cb.OptionIdx >= len(q.Options) {
+			return "Invalid option"
+		}
+		selectedOption := q.Options[cb.OptionIdx]
+
+		slog.Info("user selected option",
+			"chat_id", chatID,
+			"option", selectedOption.Label,
+		)
+
+		// Clear pending question
+		pendingMu.Lock()
+		delete(pendingQuestions, chatID)
+		pendingMu.Unlock()
+
+		// Send the selection back to Claude as a user message
+		// The selection is sent as plain text which Claude will interpret
+		go func() {
+			// Start typing indicator
+			stopTyping := bot.TypingLoop(chatID)
+			defer stopTyping()
+
+			err := manager.Send(cbCtx, chatID, selectedOption.Label, claude.ResponseCallbacks{
+				OnMessage: func(text string, isFinal bool) {
+					silent := !isFinal
+					bot.SendMessage(chatID, text, silent)
+				},
+				OnToolUse: func(tool claude.ToolUse) {
+					// Handle nested AskUserQuestion or other tools
+					if tool.Name == "AskUserQuestion" {
+						parsed, err := telegram.ParseAskUserQuestion(tool.Input)
+						if err != nil {
+							slog.Error("failed to parse AskUserQuestion in callback", "error", err)
+							return
+						}
+						pendingMu.Lock()
+						pendingQuestions[chatID] = &PendingQuestion{
+							ToolID:    tool.ID,
+							Questions: parsed.Questions,
+						}
+						pendingMu.Unlock()
+						for i, q := range parsed.Questions {
+							keyboard, text := telegram.BuildQuestionKeyboard(tool.ID, i, q)
+							bot.SendQuestionKeyboard(chatID, text, keyboard)
+						}
+						return
+					}
+					notification := telegram.FormatToolNotification(telegram.ToolUse{
+						ID:    tool.ID,
+						Name:  tool.Name,
+						Input: tool.Input,
+					})
+					bot.SendMessage(chatID, notification, true)
+				},
+			})
+			if err != nil {
+				slog.Error("error sending callback response to claude", "error", err)
+				bot.SendMessage(chatID, "Sorry, something went wrong.", false)
+			}
+		}()
+
+		return "Selected: " + selectedOption.Label
 	})
 
 	slog.Info("aria started, connecting to telegram")

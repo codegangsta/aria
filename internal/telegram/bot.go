@@ -23,12 +23,17 @@ type ReplyHTMLFunc func(html string, replyToMsgID int64, silent bool)
 // msgID is the ID of the user's message (for replies)
 type MessageHandler func(ctx context.Context, chatID int64, userID int64, msgID int64, text string, respond RespondFunc, replyHTML ReplyHTMLFunc)
 
+// CallbackHandler is called when an inline keyboard button is pressed
+// Returns the text to show the user after button press
+type CallbackHandler func(ctx context.Context, chatID int64, userID int64, data string) string
+
 // Bot wraps the Telegram bot functionality
 type Bot struct {
 	bot                *gotgbot.Bot
 	updater            *ext.Updater
 	allowlist          map[int64]bool
 	handler            MessageHandler
+	callbackHandler    CallbackHandler
 	logger             *slog.Logger
 	debug              bool
 	commandsRegistered bool
@@ -71,6 +76,11 @@ func (b *Bot) SetHandler(h MessageHandler) {
 	b.handler = h
 }
 
+// SetCallbackHandler sets the callback query handler function
+func (b *Bot) SetCallbackHandler(h CallbackHandler) {
+	b.callbackHandler = h
+}
+
 // Start begins polling for updates and blocks until context is cancelled
 func (b *Bot) Start(ctx context.Context) error {
 	// Create updater and dispatcher
@@ -85,6 +95,9 @@ func (b *Bot) Start(ctx context.Context) error {
 
 	// Add message handler
 	dispatcher.AddHandler(handlers.NewMessage(nil, b.handleMessage))
+
+	// Add callback query handler for inline keyboard buttons
+	dispatcher.AddHandler(handlers.NewCallback(nil, b.handleCallback))
 
 	// Start polling
 	err := b.updater.StartPolling(b.bot, &ext.PollingOpts{
@@ -204,6 +217,49 @@ func (b *Bot) handleMessage(bot *gotgbot.Bot, ctx *ext.Context) error {
 	return nil
 }
 
+// handleCallback processes callback queries from inline keyboard buttons
+func (b *Bot) handleCallback(bot *gotgbot.Bot, ctx *ext.Context) error {
+	cb := ctx.CallbackQuery
+	if cb == nil {
+		return nil
+	}
+
+	userID := cb.From.Id
+	chatID := cb.Message.GetChat().Id
+
+	// Check allowlist
+	if !b.allowlist[userID] {
+		b.logger.Debug("ignoring callback from non-allowed user",
+			"user_id", userID,
+			"chat_id", chatID,
+		)
+		return nil
+	}
+
+	b.logger.Info("processing callback",
+		"user_id", userID,
+		"chat_id", chatID,
+		"data", cb.Data,
+	)
+
+	// Call the callback handler if set
+	var answerText string
+	if b.callbackHandler != nil {
+		cbCtx := context.Background()
+		answerText = b.callbackHandler(cbCtx, chatID, userID, cb.Data)
+	}
+
+	// Answer the callback to remove the loading state
+	_, err := cb.Answer(bot, &gotgbot.AnswerCallbackQueryOpts{
+		Text: answerText,
+	})
+	if err != nil {
+		b.logger.Warn("failed to answer callback", "error", err)
+	}
+
+	return nil
+}
+
 // startTyping sends a typing indicator and refreshes it periodically
 func (b *Bot) startTyping(chatID int64) {
 	_, _ = b.bot.SendChatAction(chatID, "typing", nil)
@@ -225,6 +281,22 @@ func (b *Bot) SendMessage(chatID int64, text string, silent bool) error {
 			DisableNotification: silent,
 		}
 		_, err = b.bot.SendMessage(chatID, text, plainOpts)
+	}
+	return err
+}
+
+// SendQuestionKeyboard sends a question with inline keyboard options
+func (b *Bot) SendQuestionKeyboard(chatID int64, text string, keyboard gotgbot.InlineKeyboardMarkup) error {
+	opts := &gotgbot.SendMessageOpts{
+		ParseMode:   "HTML",
+		ReplyMarkup: keyboard,
+	}
+	_, err := b.bot.SendMessage(chatID, text, opts)
+	if err != nil {
+		b.logger.Error("failed to send question keyboard",
+			"chat_id", chatID,
+			"error", err,
+		)
 	}
 	return err
 }
