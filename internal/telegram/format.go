@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"fmt"
+	htmlpkg "html"
 	"strings"
 
 	"github.com/gomarkdown/markdown"
@@ -23,6 +24,11 @@ type toolDisplayConfig struct {
 	Verb     string // e.g., "Running", "Reading", "Editing"
 }
 
+// esc escapes HTML entities in a string
+func esc(s string) string {
+	return htmlpkg.EscapeString(s)
+}
+
 // toolDisplays maps tool names to their display configuration
 var toolDisplays = map[string]toolDisplayConfig{
 	"Bash": {
@@ -34,7 +40,7 @@ var toolDisplays = map[string]toolDisplayConfig{
 				if len(cmd) > 60 {
 					cmd = cmd[:57] + "..."
 				}
-				return fmt.Sprintf("`%s`", cmd)
+				return fmt.Sprintf("<code>%s</code>", esc(cmd))
 			}
 			return ""
 		},
@@ -44,7 +50,7 @@ var toolDisplays = map[string]toolDisplayConfig{
 		Verb:  "Reading",
 		Format: func(input map[string]interface{}) string {
 			if path, ok := input["file_path"].(string); ok {
-				return shortPath(path)
+				return esc(shortPath(path))
 			}
 			return ""
 		},
@@ -54,7 +60,7 @@ var toolDisplays = map[string]toolDisplayConfig{
 		Verb:  "Editing",
 		Format: func(input map[string]interface{}) string {
 			if path, ok := input["file_path"].(string); ok {
-				return shortPath(path)
+				return esc(shortPath(path))
 			}
 			return ""
 		},
@@ -64,7 +70,7 @@ var toolDisplays = map[string]toolDisplayConfig{
 		Verb:  "Writing",
 		Format: func(input map[string]interface{}) string {
 			if path, ok := input["file_path"].(string); ok {
-				return shortPath(path)
+				return esc(shortPath(path))
 			}
 			return ""
 		},
@@ -77,7 +83,7 @@ var toolDisplays = map[string]toolDisplayConfig{
 				if len(pattern) > 40 {
 					pattern = pattern[:37] + "..."
 				}
-				return fmt.Sprintf("`%s`", pattern)
+				return fmt.Sprintf("<code>%s</code>", esc(pattern))
 			}
 			return ""
 		},
@@ -87,7 +93,7 @@ var toolDisplays = map[string]toolDisplayConfig{
 		Verb:  "Finding",
 		Format: func(input map[string]interface{}) string {
 			if pattern, ok := input["pattern"].(string); ok {
-				return fmt.Sprintf("`%s`", pattern)
+				return fmt.Sprintf("<code>%s</code>", esc(pattern))
 			}
 			return ""
 		},
@@ -97,10 +103,10 @@ var toolDisplays = map[string]toolDisplayConfig{
 		Verb:  "Spawning",
 		Format: func(input map[string]interface{}) string {
 			if desc, ok := input["description"].(string); ok {
-				return desc
+				return esc(desc)
 			}
 			if agentType, ok := input["subagent_type"].(string); ok {
-				return agentType + " agent"
+				return esc(agentType) + " agent"
 			}
 			return "agent"
 		},
@@ -116,7 +122,7 @@ var toolDisplays = map[string]toolDisplayConfig{
 				if idx := strings.Index(url, "/"); idx > 0 {
 					url = url[:idx]
 				}
-				return url
+				return esc(url)
 			}
 			return ""
 		},
@@ -129,7 +135,7 @@ var toolDisplays = map[string]toolDisplayConfig{
 				if len(query) > 40 {
 					query = query[:37] + "..."
 				}
-				return fmt.Sprintf(`"%s"`, query)
+				return fmt.Sprintf(`"%s"`, esc(query))
 			}
 			return ""
 		},
@@ -147,10 +153,10 @@ var mcpToolDisplays = map[string]toolDisplayConfig{
 				if len(title) > 30 {
 					title = title[:27] + "..."
 				}
-				return title
+				return esc(title)
 			}
 			if query, ok := input["query"].(string); ok {
-				return fmt.Sprintf(`"%s"`, query)
+				return fmt.Sprintf(`"%s"`, esc(query))
 			}
 			return ""
 		},
@@ -165,10 +171,10 @@ var mcpToolDisplays = map[string]toolDisplayConfig{
 				if idx := strings.Index(url, "/"); idx > 0 {
 					url = url[:idx]
 				}
-				return url
+				return esc(url)
 			}
 			if action, ok := input["action"].(string); ok {
-				return action
+				return esc(action)
 			}
 			return ""
 		},
@@ -217,33 +223,6 @@ func shortPath(path string) string {
 		return path[idx+1:]
 	}
 	return path
-}
-
-// FormatToolSummary creates a grouped summary of tool calls with spoiler details
-// Format: "⚙️ Used N tools\n||detail1\ndetail2||"
-func FormatToolSummary(tools []ToolUse) string {
-	if len(tools) == 0 {
-		return ""
-	}
-
-	// Build the details list
-	var details []string
-	for _, tool := range tools {
-		details = append(details, FormatToolNotification(tool))
-	}
-
-	// Format header based on count
-	var header string
-	if len(tools) == 1 {
-		header = "⚙️ Used 1 tool"
-	} else {
-		header = fmt.Sprintf("⚙️ Used %d tools", len(tools))
-	}
-
-	// Combine with spoiler tag for details
-	// Telegram spoiler format: ||hidden text||
-	spoilerContent := strings.Join(details, "\n")
-	return fmt.Sprintf("%s\n<tg-spoiler>%s</tg-spoiler>", header, spoilerContent)
 }
 
 // FormatHTML converts markdown text to Telegram-compatible HTML.

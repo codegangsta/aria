@@ -13,9 +13,15 @@ import (
 	"github.com/PaulSonOfLars/gotgbot/v2/ext/handlers"
 )
 
+// RespondFunc sends a markdown message (will be converted to HTML)
+type RespondFunc func(text string, silent bool)
+
+// ReplyHTMLFunc sends pre-formatted HTML as a reply to a specific message
+type ReplyHTMLFunc func(html string, replyToMsgID int64, silent bool)
+
 // MessageHandler is called when a message is received from an allowed user
-// The respond callback takes text and a silent flag (silent=true disables notification sound)
-type MessageHandler func(ctx context.Context, chatID int64, userID int64, text string, respond func(text string, silent bool))
+// msgID is the ID of the user's message (for replies)
+type MessageHandler func(ctx context.Context, chatID int64, userID int64, msgID int64, text string, respond RespondFunc, replyHTML ReplyHTMLFunc)
 
 // Bot wraps the Telegram bot functionality
 type Bot struct {
@@ -148,8 +154,7 @@ func (b *Bot) handleMessage(bot *gotgbot.Bot, ctx *ext.Context) error {
 		// Start typing indicator
 		b.startTyping(chatID)
 
-		// Create respond function that sends messages back with markdown formatting
-		// silent=true disables notification sound (for intermediate messages)
+		// respond converts markdown to HTML before sending
 		respond := func(text string, silent bool) {
 			formatted := FormatHTML(text)
 			opts := &gotgbot.SendMessageOpts{
@@ -174,8 +179,26 @@ func (b *Bot) handleMessage(bot *gotgbot.Bot, ctx *ext.Context) error {
 			}
 		}
 
+		// replyHTML sends pre-formatted HTML as a reply to a specific message
+		replyHTML := func(html string, replyToMsgID int64, silent bool) {
+			opts := &gotgbot.SendMessageOpts{
+				ParseMode:           "HTML",
+				DisableNotification: silent,
+				ReplyParameters: &gotgbot.ReplyParameters{
+					MessageId: replyToMsgID,
+				},
+			}
+			if _, err := bot.SendMessage(chatID, html, opts); err != nil {
+				b.logger.Warn("HTML reply failed",
+					"chat_id", chatID,
+					"reply_to", replyToMsgID,
+					"error", err,
+				)
+			}
+		}
+
 		// Call handler (this blocks until Claude responds)
-		b.handler(msgCtx, chatID, userID, msg.Text, respond)
+		b.handler(msgCtx, chatID, userID, msg.MessageId, msg.Text, respond, replyHTML)
 	}
 
 	return nil

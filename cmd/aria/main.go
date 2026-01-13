@@ -74,10 +74,11 @@ func main() {
 	}()
 
 	// Set up message handler
-	bot.SetHandler(func(msgCtx context.Context, chatID int64, userID int64, text string, respond func(string, bool)) {
+	bot.SetHandler(func(msgCtx context.Context, chatID int64, userID int64, msgID int64, text string, respond telegram.RespondFunc, replyHTML telegram.ReplyHTMLFunc) {
 		slog.Info("processing message",
 			"chat_id", chatID,
 			"user_id", userID,
+			"msg_id", msgID,
 			"text_length", len(text),
 		)
 
@@ -105,26 +106,12 @@ func main() {
 		// Track if we got any response
 		gotResponse := false
 
-		// Collect tool calls to send as grouped summary
-		var toolCalls []telegram.ToolUse
-
 		// Send message via persistent process manager
 		// isFinal=true means it's the last message, so we play a sound
 		// isFinal=false means intermediate message, send silently
 		err := manager.Send(msgCtx, chatID, text, claude.ResponseCallbacks{
 			OnMessage: func(responseText string, isFinal bool) {
 				gotResponse = true
-
-				// Send tool summary before final response
-				if isFinal && len(toolCalls) > 0 {
-					summary := telegram.FormatToolSummary(toolCalls)
-					slog.Debug("sending tool summary",
-						"chat_id", chatID,
-						"tool_count", len(toolCalls),
-					)
-					respond(summary, true) // Silent for tool summary
-				}
-
 				silent := !isFinal // Silent for intermediate messages, sound for final
 				slog.Debug("sending response to telegram",
 					"chat_id", chatID,
@@ -136,17 +123,18 @@ func main() {
 				slog.Debug("response sent")
 			},
 			OnToolUse: func(tool claude.ToolUse) {
-				// Collect tool calls for grouped summary
-				toolCalls = append(toolCalls, telegram.ToolUse{
+				// Format and send tool notification as reply to user's message
+				notification := telegram.FormatToolNotification(telegram.ToolUse{
 					ID:    tool.ID,
 					Name:  tool.Name,
 					Input: tool.Input,
 				})
-				slog.Debug("tool use collected",
+				slog.Debug("tool use notification",
 					"chat_id", chatID,
 					"tool", tool.Name,
-					"total_tools", len(toolCalls),
+					"notification", notification,
 				)
+				replyHTML(notification, msgID, true) // Reply to user's message, silent
 			},
 		})
 
