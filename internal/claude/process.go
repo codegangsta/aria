@@ -180,11 +180,26 @@ type InputRequestEvent struct {
 	ToolID string `json:"tool_use_id"`
 }
 
+// ToolResult represents the result of a tool execution
+type ToolResult struct {
+	ToolID  string
+	IsError bool
+}
+
 // ResponseCallbacks holds callbacks for different response types
 type ResponseCallbacks struct {
 	OnMessage      func(text string, isFinal bool)
 	OnToolUse      func(tool ToolUse)
-	OnInputRequest func(toolID string) // Called when Claude needs user input (e.g., AskUserQuestion)
+	OnToolResult   func(result ToolResult) // Called when a tool completes (success or failure)
+	OnInputRequest func(toolID string)     // Called when Claude needs user input (e.g., AskUserQuestion)
+}
+
+// ToolResultEvent represents an event containing tool result information
+type ToolResultEvent struct {
+	Type      string `json:"type"`
+	Subtype   string `json:"subtype,omitempty"`
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	IsError   bool   `json:"is_error,omitempty"`
 }
 
 // ReadResponses reads stream-json responses and calls callbacks for assistant text and tool use
@@ -196,6 +211,9 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 	var lastMessage string
 	var hasMessage bool
 
+	// Track pending tool IDs to detect completion
+	pendingTools := make(map[string]bool)
+
 	// Helper to flush the buffered message (not final)
 	flushBuffer := func() {
 		if hasMessage && callbacks.OnMessage != nil {
@@ -203,6 +221,30 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 			hasMessage = false
 			lastMessage = ""
 		}
+	}
+
+	// Helper to complete a specific tool with success/failure
+	completeTool := func(toolID string, isError bool) {
+		if pendingTools[toolID] && callbacks.OnToolResult != nil {
+			callbacks.OnToolResult(ToolResult{
+				ToolID:  toolID,
+				IsError: isError,
+			})
+			delete(pendingTools, toolID)
+		}
+	}
+
+	// Helper to complete all pending tools as success
+	completeAllPending := func() {
+		for toolID := range pendingTools {
+			if callbacks.OnToolResult != nil {
+				callbacks.OnToolResult(ToolResult{
+					ToolID:  toolID,
+					IsError: false,
+				})
+			}
+		}
+		pendingTools = make(map[string]bool)
 	}
 
 	for p.scanner.Scan() {
@@ -227,6 +269,15 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 			"json", line,
 		)
 
+		// Check for tool result events (success or error)
+		var toolResultEvent ToolResultEvent
+		if json.Unmarshal([]byte(line), &toolResultEvent) == nil {
+			if toolResultEvent.ToolUseID != "" {
+				// This event references a tool - check if it indicates error
+				completeTool(toolResultEvent.ToolUseID, toolResultEvent.IsError)
+			}
+		}
+
 		// Capture slash commands from init event (only once)
 		if event.Type == "system" && p.slashCommands == nil {
 			var initEvent InitEvent
@@ -243,6 +294,8 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 		if event.Type == "assistant" {
 			for _, content := range event.Message.Content {
 				if content.Type == "text" && content.Text != "" {
+					// Text content means any pending tools have completed
+					completeAllPending()
 					// Flush previous message (it wasn't final)
 					flushBuffer()
 					// Buffer this message (might be final)
@@ -250,9 +303,13 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 					hasMessage = true
 				}
 				if content.Type == "tool_use" && content.Name != "" {
+					// New tool_use means previous tools have completed
+					completeAllPending()
 					// Flush any pending text BEFORE emitting tool use
 					// This ensures text appears before tool notifications/keyboards
 					flushBuffer()
+					// Track this tool as pending
+					pendingTools[content.ID] = true
 					// Emit tool use event
 					if callbacks.OnToolUse != nil {
 						callbacks.OnToolUse(ToolUse{
@@ -272,6 +329,8 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 
 		// Result event indicates end of response
 		if event.Type == "result" {
+			// Complete any remaining pending tools
+			completeAllPending()
 			p.logger.Debug("result received, response complete",
 				"chat_id", p.chatID,
 				"has_final_message", hasMessage,
@@ -291,6 +350,16 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 					"chat_id", p.chatID,
 					"tool_id", inputReq.ToolID,
 				)
+				// Complete any pending tools (except the one waiting for input)
+				for toolID := range pendingTools {
+					if toolID != inputReq.ToolID && callbacks.OnToolResult != nil {
+						callbacks.OnToolResult(ToolResult{
+							ToolID:  toolID,
+							IsError: false,
+						})
+						delete(pendingTools, toolID)
+					}
+				}
 				// Flush any pending message (not final, since we're waiting for input)
 				flushBuffer()
 				if callbacks.OnInputRequest != nil {

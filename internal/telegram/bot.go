@@ -313,6 +313,37 @@ func (b *Bot) SendMessageMarkdownV2(chatID int64, text string, silent bool) erro
 	return err
 }
 
+// SendToolNotification sends a tool notification and returns the message ID
+// Used for tool call notifications that may be edited later
+func (b *Bot) SendToolNotification(chatID int64, text string) (int64, error) {
+	opts := &gotgbot.SendMessageOpts{
+		ParseMode:           "MarkdownV2",
+		DisableNotification: true, // Always silent for tool notifications
+	}
+	msg, err := b.bot.SendMessage(chatID, text, opts)
+	if err != nil {
+		b.logger.Warn("failed to send tool notification", "error", err, "text", text)
+		return 0, err
+	}
+	return msg.MessageId, nil
+}
+
+// EditMessageMarkdownV2 edits an existing message with new MarkdownV2 content
+func (b *Bot) EditMessageMarkdownV2(chatID int64, msgID int64, text string) error {
+	opts := &gotgbot.EditMessageTextOpts{
+		ParseMode: "MarkdownV2",
+	}
+	_, _, err := b.bot.EditMessageText(text, &gotgbot.EditMessageTextOpts{
+		ChatId:    chatID,
+		MessageId: msgID,
+		ParseMode: opts.ParseMode,
+	})
+	if err != nil {
+		b.logger.Warn("failed to edit message", "error", err, "chat_id", chatID, "msg_id", msgID)
+	}
+	return err
+}
+
 // SendQuestionKeyboard sends a question with inline keyboard options
 func (b *Bot) SendQuestionKeyboard(chatID int64, text string, keyboard gotgbot.InlineKeyboardMarkup) error {
 	opts := &gotgbot.SendMessageOpts{

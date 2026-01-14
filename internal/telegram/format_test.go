@@ -53,6 +53,42 @@ func TestFormatMarkdownV2(t *testing.T) {
 			contains: []string{"~deleted~"},
 			notContains: []string{"~~"},
 		},
+		{
+			name:     "inline code with func keyword",
+			input:    "Found `func main` in the code",
+			contains: []string{"`func main`"},
+			notContains: []string{"PLACEHOLDER", "XPLACEHOLDER"},
+		},
+		{
+			name:     "multiple inline code blocks",
+			input:    "Use `foo` and `bar` together",
+			contains: []string{"`foo`", "`bar`"},
+			notContains: []string{"PLACEHOLDER"},
+		},
+		{
+			name:     "bold inside numbered list",
+			input:    "1. **func main** - entry point",
+			contains: []string{"*func main*"},
+			notContains: []string{"PLACEHOLDER", "**"},
+		},
+		{
+			name:     "mixed formatting no placeholder leak",
+			input:    "Check `error` in **bold** with [link](http://x.com)",
+			contains: []string{"`error`", "*bold*", "["},
+			notContains: []string{"PLACEHOLDER"},
+		},
+		{
+			name:  "numbered list with inline code",
+			input: "**1. `func main`** - Entry point in cmd/aria/main.go:26",
+			contains: []string{"`func main`"},
+			notContains: []string{"PLACEHOLDER"},
+		},
+		{
+			name:  "exact failing case from production",
+			input: "Done! Here's what I found:\n\n**1. `func main`** - Entry point in `cmd/aria/main.go:26`, plus test examples\n\n**2. `TODO`** - Just one",
+			contains: []string{"`func main`", "`TODO`", "`cmd/aria/main.go:26`"},
+			notContains: []string{"PLACEHOLDER"},
+		},
 	}
 
 	for _, tt := range tests {

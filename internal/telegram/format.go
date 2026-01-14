@@ -169,11 +169,8 @@ var mcpToolDisplays = map[string]toolDisplayConfig{
 	},
 }
 
-// FormatToolNotification creates a Telegram-friendly display of a tool call
-// Returns italic text for a subtle, compact appearance
-func FormatToolNotification(tool ToolUse) string {
-	var content string
-
+// formatToolText creates the text content of a tool notification (no emoji, no italic wrapper)
+func formatToolText(tool ToolUse) string {
 	// Check for exact tool match first
 	if cfg, ok := toolDisplays[tool.Name]; ok {
 		detail := ""
@@ -181,40 +178,49 @@ func FormatToolNotification(tool ToolUse) string {
 			detail = cfg.Format(tool.Input)
 		}
 		if detail != "" {
-			content = fmt.Sprintf("%s %s %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb), detail)
-		} else {
-			content = fmt.Sprintf("%s %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb))
+			return fmt.Sprintf("%s %s", escapeMarkdownV2(cfg.Verb), detail)
 		}
-	} else {
-		// Check for MCP tool prefixes
-		found := false
-		for prefix, cfg := range mcpToolDisplays {
-			if strings.HasPrefix(tool.Name, prefix) {
-				operation := strings.TrimPrefix(tool.Name, prefix)
-				operation = strings.ReplaceAll(operation, "_", " ")
+		return escapeMarkdownV2(cfg.Verb)
+	}
 
-				detail := ""
-				if cfg.Format != nil {
-					detail = cfg.Format(tool.Input)
-				}
-				if detail != "" {
-					content = fmt.Sprintf("%s %s: %s %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb), escapeMarkdownV2(operation), detail)
-				} else {
-					content = fmt.Sprintf("%s %s: %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb), escapeMarkdownV2(operation))
-				}
-				found = true
-				break
+	// Check for MCP tool prefixes
+	for prefix, cfg := range mcpToolDisplays {
+		if strings.HasPrefix(tool.Name, prefix) {
+			operation := strings.TrimPrefix(tool.Name, prefix)
+			operation = strings.ReplaceAll(operation, "_", " ")
+
+			detail := ""
+			if cfg.Format != nil {
+				detail = cfg.Format(tool.Input)
 			}
-		}
-
-		// Fallback for unknown tools
-		if !found {
-			content = fmt.Sprintf("⚙️ %s", escapeMarkdownV2(tool.Name))
+			if detail != "" {
+				return fmt.Sprintf("%s: %s %s", escapeMarkdownV2(cfg.Verb), escapeMarkdownV2(operation), detail)
+			}
+			return fmt.Sprintf("%s: %s", escapeMarkdownV2(cfg.Verb), escapeMarkdownV2(operation))
 		}
 	}
 
-	// Wrap in italic for subtle appearance
-	return "_" + content + "_"
+	// Fallback for unknown tools
+	return escapeMarkdownV2(tool.Name)
+}
+
+// FormatToolNotification creates a Telegram-friendly display of a tool call in progress
+// Returns italic text with ◌ prefix for subtle, compact appearance
+func FormatToolNotification(tool ToolUse) string {
+	content := formatToolText(tool)
+	return "_◌ " + content + "_"
+}
+
+// FormatToolNotificationSuccess creates a completed tool notification with ✓
+func FormatToolNotificationSuccess(tool ToolUse) string {
+	content := formatToolText(tool)
+	return "_✓ " + content + "_"
+}
+
+// FormatToolNotificationFailure creates a failed tool notification with ✗
+func FormatToolNotificationFailure(tool ToolUse) string {
+	content := formatToolText(tool)
+	return "_✗ " + content + "_"
 }
 
 // shortPath returns just the filename from a path
@@ -276,10 +282,17 @@ func FormatMarkdownV2(text string) string {
 	placeholders := make(map[string]string)
 	counter := 0
 
+	// Helper to generate unique placeholder keys
+	// Using hex digits only - no special chars that need escaping
+	genKey := func(prefix string) string {
+		key := fmt.Sprintf("XPLACEHOLDERX%sX%dX", prefix, counter)
+		counter++
+		return key
+	}
+
 	// Step 1: Extract and protect code blocks
 	text = codeBlockRegex.ReplaceAllStringFunc(text, func(match string) string {
-		key := fmt.Sprintf("\x00CODEBLOCK%d\x00", counter)
-		counter++
+		key := genKey("CB")
 
 		parts := codeBlockRegex.FindStringSubmatch(match)
 		lang := ""
@@ -301,8 +314,7 @@ func FormatMarkdownV2(text string) string {
 
 	// Step 2: Extract and protect inline code
 	text = inlineCodeRegex.ReplaceAllStringFunc(text, func(match string) string {
-		key := fmt.Sprintf("\x00INLINECODE%d\x00", counter)
-		counter++
+		key := genKey("IC")
 
 		parts := inlineCodeRegex.FindStringSubmatch(match)
 		if len(parts) >= 2 {
@@ -316,8 +328,7 @@ func FormatMarkdownV2(text string) string {
 
 	// Step 3: Extract and protect links
 	text = linkRegex.ReplaceAllStringFunc(text, func(match string) string {
-		key := fmt.Sprintf("\x00LINK%d\x00", counter)
-		counter++
+		key := genKey("LK")
 
 		parts := linkRegex.FindStringSubmatch(match)
 		if len(parts) >= 3 {
@@ -335,8 +346,7 @@ func FormatMarkdownV2(text string) string {
 
 	// Step 4: Convert bold **text** to *text*
 	text = boldRegex.ReplaceAllStringFunc(text, func(match string) string {
-		key := fmt.Sprintf("\x00BOLD%d\x00", counter)
-		counter++
+		key := genKey("BD")
 
 		parts := boldRegex.FindStringSubmatch(match)
 		if len(parts) >= 2 {
@@ -350,8 +360,7 @@ func FormatMarkdownV2(text string) string {
 
 	// Step 5: Convert strikethrough ~~text~~ to ~text~
 	text = strikethroughRegex.ReplaceAllStringFunc(text, func(match string) string {
-		key := fmt.Sprintf("\x00STRIKE%d\x00", counter)
-		counter++
+		key := genKey("ST")
 
 		parts := strikethroughRegex.FindStringSubmatch(match)
 		if len(parts) >= 2 {
@@ -364,11 +373,31 @@ func FormatMarkdownV2(text string) string {
 	})
 
 	// Step 6: Escape remaining special characters in plain text
+	// The placeholder keys use Unicode private use area chars that aren't in
+	// markdownV2SpecialChars, so they pass through unchanged
 	text = escapeMarkdownV2(text)
 
-	// Step 7: Restore all placeholders
-	for key, value := range placeholders {
-		text = strings.ReplaceAll(text, escapeMarkdownV2(key), value)
+	// Step 7: Restore all placeholders (keys are unchanged after escaping)
+	// We need multiple passes because placeholders can be nested
+	// (e.g., inline code inside bold text)
+	for i := 0; i < 3; i++ { // Max 3 levels of nesting should be plenty
+		prevText := text
+		for key, value := range placeholders {
+			text = strings.ReplaceAll(text, key, value)
+		}
+		// Also restore placeholders that ended up inside other placeholder values
+		for key, value := range placeholders {
+			newValue := value
+			for innerKey, innerValue := range placeholders {
+				newValue = strings.ReplaceAll(newValue, innerKey, innerValue)
+			}
+			if newValue != value {
+				placeholders[key] = newValue
+			}
+		}
+		if text == prevText {
+			break // No more changes
+		}
 	}
 
 	return strings.TrimSpace(text)

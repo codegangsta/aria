@@ -72,6 +72,37 @@ func main() {
 	pendingQuestions := make(map[int64]*PendingQuestion)
 	var pendingMu sync.RWMutex
 
+	// Tool status trackers for consolidated tool notifications (chatID -> tracker)
+	toolTrackers := make(map[int64]*telegram.ToolStatusTracker)
+	var trackersMu sync.Mutex
+
+	// getOrCreateTracker gets or creates a tool status tracker for a chat
+	getOrCreateTracker := func(chatID int64) *telegram.ToolStatusTracker {
+		trackersMu.Lock()
+		defer trackersMu.Unlock()
+
+		if tracker, ok := toolTrackers[chatID]; ok {
+			return tracker
+		}
+
+		tracker := telegram.NewToolStatusTracker(bot, chatID)
+		tracker.Start()
+		toolTrackers[chatID] = tracker
+		return tracker
+	}
+
+	// clearTracker flushes and clears a tracker for a chat
+	clearTracker := func(chatID int64) {
+		trackersMu.Lock()
+		tracker := toolTrackers[chatID]
+		trackersMu.Unlock()
+
+		if tracker != nil {
+			tracker.Flush() // Force final render before clearing
+			tracker.Clear()
+		}
+	}
+
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -157,6 +188,11 @@ func main() {
 			OnMessage: func(responseText string, isFinal bool) {
 				gotResponse = true
 				silent := !isFinal // Silent for intermediate messages, sound for final
+
+				// Flush and clear tracker before sending text to start new tool group
+				tracker := getOrCreateTracker(chatID)
+				tracker.FlushAndClear()
+
 				slog.Debug("sending response to telegram",
 					"chat_id", chatID,
 					"text_length", len(responseText),
@@ -167,7 +203,7 @@ func main() {
 				slog.Debug("response sent")
 			},
 			OnToolUse: func(tool claude.ToolUse) {
-				// Handle AskUserQuestion specially - send inline keyboard
+				// Handle AskUserQuestion specially - send inline keyboard (no notification)
 				if tool.Name == "AskUserQuestion" {
 					parsed, err := telegram.ParseAskUserQuestion(tool.Input)
 					if err != nil {
@@ -203,20 +239,26 @@ func main() {
 					return
 				}
 
-				// Format and send tool notification
-				notification := telegram.FormatToolNotification(telegram.ToolUse{
+				// Add tool to consolidated tracker
+				tracker := getOrCreateTracker(chatID)
+				tracker.AddTool(telegram.ToolUse{
 					ID:    tool.ID,
 					Name:  tool.Name,
 					Input: tool.Input,
 				})
-				slog.Debug("tool use notification",
+				slog.Debug("tool added to tracker",
 					"chat_id", chatID,
 					"tool", tool.Name,
-					"notification", notification,
 				)
-				bot.SendMessageMarkdownV2(chatID, notification, true) // Send silently, not as reply
+			},
+			OnToolResult: func(result claude.ToolResult) {
+				tracker := getOrCreateTracker(chatID)
+				tracker.CompleteTool(result.ToolID, result.IsError)
 			},
 		})
+
+		// Clear the tracker after response is complete
+		clearTracker(chatID)
 
 		if err != nil {
 			slog.Error("claude error",
@@ -344,6 +386,11 @@ func main() {
 			err := manager.Send(cbCtx, chatID, selectedOption.Label, claude.ResponseCallbacks{
 				OnMessage: func(text string, isFinal bool) {
 					silent := !isFinal
+
+					// Flush and clear tracker before sending text to start new tool group
+					tracker := getOrCreateTracker(chatID)
+					tracker.FlushAndClear()
+
 					bot.SendMessage(chatID, text, silent)
 				},
 				OnToolUse: func(tool claude.ToolUse) {
@@ -368,14 +415,22 @@ func main() {
 						}
 						return
 					}
-					notification := telegram.FormatToolNotification(telegram.ToolUse{
+
+					// Add tool to consolidated tracker
+					tracker := getOrCreateTracker(chatID)
+					tracker.AddTool(telegram.ToolUse{
 						ID:    tool.ID,
 						Name:  tool.Name,
 						Input: tool.Input,
 					})
-					bot.SendMessageMarkdownV2(chatID, notification, true)
+				},
+				OnToolResult: func(result claude.ToolResult) {
+					tracker := getOrCreateTracker(chatID)
+					tracker.CompleteTool(result.ToolID, result.IsError)
 				},
 			})
+			// Clear the tracker after response
+			clearTracker(chatID)
 			if err != nil {
 				slog.Error("error sending callback response to claude", "error", err)
 				bot.SendMessage(chatID, "Sorry, something went wrong.", false)
