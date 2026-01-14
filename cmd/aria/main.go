@@ -119,6 +119,10 @@ func main() {
 	toolTrackers := make(map[int64]*telegram.ToolStatusTracker)
 	var trackersMu sync.Mutex
 
+	// Progress trackers for todo display (chatID -> tracker)
+	progressTrackers := make(map[int64]*telegram.ProgressTracker)
+	var progressMu sync.Mutex
+
 	// getOrCreateTracker gets or creates a tool status tracker for a chat
 	getOrCreateTracker := func(chatID int64) *telegram.ToolStatusTracker {
 		trackersMu.Lock()
@@ -142,6 +146,31 @@ func main() {
 
 		if tracker != nil {
 			tracker.Flush() // Force final render before clearing
+			tracker.Clear()
+		}
+	}
+
+	// getOrCreateProgressTracker gets or creates a progress tracker for a chat
+	getOrCreateProgressTracker := func(chatID int64) *telegram.ProgressTracker {
+		progressMu.Lock()
+		defer progressMu.Unlock()
+
+		if tracker, ok := progressTrackers[chatID]; ok {
+			return tracker
+		}
+
+		tracker := telegram.NewProgressTracker(bot, chatID)
+		progressTrackers[chatID] = tracker
+		return tracker
+	}
+
+	// clearProgressTracker clears the progress tracker for a chat
+	clearProgressTracker := func(chatID int64) {
+		progressMu.Lock()
+		tracker := progressTrackers[chatID]
+		progressMu.Unlock()
+
+		if tracker != nil {
 			tracker.Clear()
 		}
 	}
@@ -240,6 +269,9 @@ func main() {
 		// Track if we got any response
 		gotResponse := false
 
+		// Get progress tracker for this chat
+		progressTracker := getOrCreateProgressTracker(chatID)
+
 		// Send message via persistent process manager
 		// isFinal=true means it's the last message, so we play a sound
 		// isFinal=false means intermediate message, send silently
@@ -260,6 +292,22 @@ func main() {
 				)
 				respond(responseText, silent)
 				slog.Debug("response sent")
+			},
+			OnTodoUpdate: func(todos []claude.Todo) {
+				// Convert claude.Todo to telegram.Todo
+				telegramTodos := make([]telegram.Todo, len(todos))
+				for i, t := range todos {
+					telegramTodos[i] = telegram.Todo{
+						Content:    t.Content,
+						Status:     t.Status,
+						ActiveForm: t.ActiveForm,
+					}
+				}
+				progressTracker.Update(telegramTodos)
+				slog.Debug("todo update",
+					"chat_id", chatID,
+					"count", len(todos),
+				)
 			},
 			OnToolUse: func(tool claude.ToolUse) {
 				// Handle AskUserQuestion specially - send inline keyboard (no notification)
@@ -318,8 +366,9 @@ func main() {
 			},
 		})
 
-		// Clear the tracker after response is complete
+		// Clear the trackers after response is complete
 		clearTracker(chatID)
+		clearProgressTracker(chatID)
 
 		if err != nil {
 			slog.Error("claude error",
@@ -475,6 +524,9 @@ func main() {
 			stopTyping := bot.TypingLoop(chatID)
 			defer stopTyping()
 
+			// Get progress tracker for this chat
+			progressTracker := getOrCreateProgressTracker(chatID)
+
 			err := manager.Send(cbCtx, chatID, combinedAnswer, claude.ResponseCallbacks{
 				OnMessage: func(text string, isFinal bool) {
 					silent := !isFinal
@@ -484,6 +536,18 @@ func main() {
 					tracker.FlushAndClear()
 
 					bot.SendMessage(chatID, text, silent)
+				},
+				OnTodoUpdate: func(todos []claude.Todo) {
+					// Convert claude.Todo to telegram.Todo
+					telegramTodos := make([]telegram.Todo, len(todos))
+					for i, t := range todos {
+						telegramTodos[i] = telegram.Todo{
+							Content:    t.Content,
+							Status:     t.Status,
+							ActiveForm: t.ActiveForm,
+						}
+					}
+					progressTracker.Update(telegramTodos)
 				},
 				OnToolUse: func(tool claude.ToolUse) {
 					// Handle nested AskUserQuestion or other tools
@@ -523,8 +587,9 @@ func main() {
 					tracker.CompleteTool(result.ToolID, result.IsError)
 				},
 			})
-			// Clear the tracker after response
+			// Clear the trackers after response
 			clearTracker(chatID)
+			clearProgressTracker(chatID)
 			if err != nil {
 				slog.Error("error sending callback response to claude", "error", err)
 				bot.SendMessage(chatID, "Sorry, something went wrong.", false)

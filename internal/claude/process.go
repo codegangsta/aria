@@ -188,12 +188,26 @@ type ToolResult struct {
 	IsError bool
 }
 
+// Todo represents a single todo item from Claude's TodoWrite
+type Todo struct {
+	Content    string `json:"content"`
+	Status     string `json:"status"` // "pending", "in_progress", "completed"
+	ActiveForm string `json:"activeForm"`
+}
+
+// TodoEvent represents a todo update event from Claude
+type TodoEvent struct {
+	Type  string `json:"type"`
+	Todos []Todo `json:"todos"`
+}
+
 // ResponseCallbacks holds callbacks for different response types
 type ResponseCallbacks struct {
 	OnMessage      func(text string, isFinal bool)
 	OnToolUse      func(tool ToolUse)
 	OnToolResult   func(result ToolResult) // Called when a tool completes (success or failure)
 	OnInputRequest func(toolID string)     // Called when Claude needs user input (e.g., AskUserQuestion)
+	OnTodoUpdate   func(todos []Todo)      // Called when Claude updates todos via TodoWrite
 }
 
 // ToolResultEvent represents an event containing tool result information
@@ -329,6 +343,32 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 				flushBuffer()
 				// Track this tool as pending
 				pendingTools[content.ID] = true
+
+				// Special handling for TodoWrite - extract and emit todos
+				if content.Name == "TodoWrite" && callbacks.OnTodoUpdate != nil {
+					if todosRaw, ok := content.Input["todos"]; ok {
+						if todosSlice, ok := todosRaw.([]interface{}); ok {
+							todos := make([]Todo, 0, len(todosSlice))
+							for _, t := range todosSlice {
+								if todoMap, ok := t.(map[string]interface{}); ok {
+									todo := Todo{}
+									if c, ok := todoMap["content"].(string); ok {
+										todo.Content = c
+									}
+									if s, ok := todoMap["status"].(string); ok {
+										todo.Status = s
+									}
+									if a, ok := todoMap["activeForm"].(string); ok {
+										todo.ActiveForm = a
+									}
+									todos = append(todos, todo)
+								}
+							}
+							callbacks.OnTodoUpdate(todos)
+						}
+					}
+				}
+
 				// Emit tool use event
 				if callbacks.OnToolUse != nil {
 					callbacks.OnToolUse(ToolUse{

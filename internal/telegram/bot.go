@@ -344,6 +344,49 @@ func (b *Bot) EditMessageMarkdownV2(chatID int64, msgID int64, text string) erro
 	return err
 }
 
+// PinMessage pins a message in the chat (silently by default)
+func (b *Bot) PinMessage(chatID int64, msgID int64) error {
+	_, err := b.bot.PinChatMessage(chatID, msgID, &gotgbot.PinChatMessageOpts{
+		DisableNotification: true,
+	})
+	if err != nil {
+		b.logger.Warn("failed to pin message", "error", err, "chat_id", chatID, "msg_id", msgID)
+	}
+	return err
+}
+
+// UnpinMessage unpins a specific message in the chat
+func (b *Bot) UnpinMessage(chatID int64, msgID int64) error {
+	_, err := b.bot.UnpinChatMessage(chatID, &gotgbot.UnpinChatMessageOpts{
+		MessageId: &msgID,
+	})
+	if err != nil {
+		b.logger.Warn("failed to unpin message", "error", err, "chat_id", chatID, "msg_id", msgID)
+	}
+	return err
+}
+
+// SendAndPinMessage sends a message and pins it, returning the message ID
+func (b *Bot) SendAndPinMessage(chatID int64, text string) (int64, error) {
+	formatted := FormatMarkdownV2(text)
+	opts := &gotgbot.SendMessageOpts{
+		ParseMode:           "MarkdownV2",
+		DisableNotification: true,
+	}
+	msg, err := b.bot.SendMessage(chatID, formatted, opts)
+	if err != nil {
+		b.logger.Warn("failed to send message for pinning", "error", err)
+		return 0, err
+	}
+
+	// Pin the message (ignore pin errors - might not have permission)
+	if pinErr := b.PinMessage(chatID, msg.MessageId); pinErr != nil {
+		b.logger.Debug("could not pin message (permissions?)", "error", pinErr)
+	}
+
+	return msg.MessageId, nil
+}
+
 // SendQuestionKeyboard sends a question with inline keyboard options
 func (b *Bot) SendQuestionKeyboard(chatID int64, text string, keyboard gotgbot.InlineKeyboardMarkup) error {
 	opts := &gotgbot.SendMessageOpts{
