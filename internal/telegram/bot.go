@@ -299,6 +299,20 @@ func (b *Bot) SendMessage(chatID int64, text string, silent bool) error {
 	return err
 }
 
+// SendMessageMarkdownV2 sends a pre-formatted MarkdownV2 message (no additional escaping)
+// Use this for text that's already escaped for MarkdownV2
+func (b *Bot) SendMessageMarkdownV2(chatID int64, text string, silent bool) error {
+	opts := &gotgbot.SendMessageOpts{
+		ParseMode:           "MarkdownV2",
+		DisableNotification: silent,
+	}
+	_, err := b.bot.SendMessage(chatID, text, opts)
+	if err != nil {
+		b.logger.Warn("MarkdownV2 send failed", "error", err, "text", text)
+	}
+	return err
+}
+
 // SendQuestionKeyboard sends a question with inline keyboard options
 func (b *Bot) SendQuestionKeyboard(chatID int64, text string, keyboard gotgbot.InlineKeyboardMarkup) error {
 	opts := &gotgbot.SendMessageOpts{

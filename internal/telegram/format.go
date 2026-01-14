@@ -170,7 +170,10 @@ var mcpToolDisplays = map[string]toolDisplayConfig{
 }
 
 // FormatToolNotification creates a Telegram-friendly display of a tool call
+// Returns italic text for a subtle, compact appearance
 func FormatToolNotification(tool ToolUse) string {
+	var content string
+
 	// Check for exact tool match first
 	if cfg, ok := toolDisplays[tool.Name]; ok {
 		detail := ""
@@ -178,30 +181,40 @@ func FormatToolNotification(tool ToolUse) string {
 			detail = cfg.Format(tool.Input)
 		}
 		if detail != "" {
-			return fmt.Sprintf("%s %s %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb), detail)
+			content = fmt.Sprintf("%s %s %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb), detail)
+		} else {
+			content = fmt.Sprintf("%s %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb))
 		}
-		return fmt.Sprintf("%s %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb))
+	} else {
+		// Check for MCP tool prefixes
+		found := false
+		for prefix, cfg := range mcpToolDisplays {
+			if strings.HasPrefix(tool.Name, prefix) {
+				operation := strings.TrimPrefix(tool.Name, prefix)
+				operation = strings.ReplaceAll(operation, "_", " ")
+
+				detail := ""
+				if cfg.Format != nil {
+					detail = cfg.Format(tool.Input)
+				}
+				if detail != "" {
+					content = fmt.Sprintf("%s %s: %s %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb), escapeMarkdownV2(operation), detail)
+				} else {
+					content = fmt.Sprintf("%s %s: %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb), escapeMarkdownV2(operation))
+				}
+				found = true
+				break
+			}
+		}
+
+		// Fallback for unknown tools
+		if !found {
+			content = fmt.Sprintf("⚙️ %s", escapeMarkdownV2(tool.Name))
+		}
 	}
 
-	// Check for MCP tool prefixes
-	for prefix, cfg := range mcpToolDisplays {
-		if strings.HasPrefix(tool.Name, prefix) {
-			operation := strings.TrimPrefix(tool.Name, prefix)
-			operation = strings.ReplaceAll(operation, "_", " ")
-
-			detail := ""
-			if cfg.Format != nil {
-				detail = cfg.Format(tool.Input)
-			}
-			if detail != "" {
-				return fmt.Sprintf("%s %s: %s %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb), escapeMarkdownV2(operation), detail)
-			}
-			return fmt.Sprintf("%s %s: %s", cfg.Emoji, escapeMarkdownV2(cfg.Verb), escapeMarkdownV2(operation))
-		}
-	}
-
-	// Fallback for unknown tools
-	return fmt.Sprintf("⚙️ %s", escapeMarkdownV2(tool.Name))
+	// Wrap in italic for subtle appearance
+	return "_" + content + "_"
 }
 
 // shortPath returns just the filename from a path

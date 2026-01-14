@@ -60,6 +60,7 @@ func main() {
 
 	// Create components
 	manager := claude.NewManager(*claudePath, cfg.Debug, cfg.Claude.SkipPermissions, slog.Default())
+	sessionDiscovery := claude.NewSessionDiscovery(homeDir+"/.claude", slog.Default())
 
 	bot, err := telegram.New(cfg.Telegram.Token, cfg.Allowlist, cfg.Debug, slog.Default())
 	if err != nil {
@@ -106,6 +107,37 @@ func main() {
 			slog.Info("clearing conversation", "chat_id", chatID)
 			manager.Reset(chatID)
 			respond("Conversation cleared.", false) // Play sound for clear confirmation
+			return
+		}
+
+		// Handle /sessions - show session picker keyboard
+		if cmd == "/sessions" {
+			slog.Info("showing sessions", "chat_id", chatID)
+			sessions, err := sessionDiscovery.DiscoverSessions(7)
+			if err != nil {
+				slog.Error("failed to discover sessions", "error", err)
+				respond("Failed to load sessions.", false)
+				return
+			}
+			if len(sessions) == 0 {
+				respond("No recent sessions found.", false)
+				return
+			}
+			// Convert to display info
+			var displaySessions []telegram.SessionDisplayInfo
+			for _, s := range sessions {
+				displaySessions = append(displaySessions, telegram.SessionDisplayInfo{
+					ID:          s.ID,
+					ShortID:     s.ShortID,
+					ProjectName: s.ProjectName,
+					Summary:     s.Summary,
+					TimeAgo:     claude.FormatTimeAgo(s.LastActive),
+				})
+			}
+			keyboard := telegram.BuildSessionKeyboard(displaySessions)
+			if err := bot.SendQuestionKeyboard(chatID, "*Sessions*", keyboard); err != nil {
+				slog.Error("failed to send session keyboard", "error", err)
+			}
 			return
 		}
 
@@ -171,7 +203,7 @@ func main() {
 					return
 				}
 
-				// Format and send tool notification as reply to user's message
+				// Format and send tool notification
 				notification := telegram.FormatToolNotification(telegram.ToolUse{
 					ID:    tool.ID,
 					Name:  tool.Name,
@@ -182,7 +214,7 @@ func main() {
 					"tool", tool.Name,
 					"notification", notification,
 				)
-				replyHTML(notification, msgID, true) // Reply to user's message, silent
+				bot.SendMessageMarkdownV2(chatID, notification, true) // Send silently, not as reply
 			},
 		})
 
@@ -213,6 +245,50 @@ func main() {
 		if err != nil {
 			slog.Error("failed to parse callback data", "error", err, "data", data)
 			return "Error processing selection"
+		}
+
+		// Handle session selection callbacks
+		if cb.Type == "s" {
+			if cb.Action == "f" {
+				// Start fresh
+				slog.Info("starting fresh session", "chat_id", chatID)
+				manager.Reset(chatID)
+				return "Starting fresh conversation"
+			}
+			if cb.Action == "r" && cb.SessionID != "" {
+				// Resume session
+				session := sessionDiscovery.LookupSessionByShortID(cb.SessionID)
+				if session == nil {
+					slog.Warn("session not found", "short_id", cb.SessionID)
+					return "Session not found"
+				}
+				slog.Info("resuming session", "chat_id", chatID, "session_id", session.ID)
+
+				// Get last assistant message before switching
+				lastMsg := sessionDiscovery.GetLastAssistantMessage(session.ID)
+
+				_, err := manager.GetOrCreateWithSession(chatID, session.ID)
+				if err != nil {
+					slog.Error("failed to resume session", "error", err)
+					return "Failed to resume session"
+				}
+
+				// Send last assistant message as context
+				if lastMsg != "" {
+					// Truncate if too long for Telegram
+					if len(lastMsg) > 500 {
+						lastMsg = lastMsg[:497] + "..."
+					}
+					go bot.SendMessage(chatID, "Last response:\n\n"+lastMsg, true)
+				}
+
+				summary := session.Summary
+				if len(summary) > 40 {
+					summary = summary[:37] + "..."
+				}
+				return "Resuming: " + summary
+			}
+			return "Invalid session action"
 		}
 
 		// Get the pending question for this chat
@@ -297,7 +373,7 @@ func main() {
 						Name:  tool.Name,
 						Input: tool.Input,
 					})
-					bot.SendMessage(chatID, notification, true)
+					bot.SendMessageMarkdownV2(chatID, notification, true)
 				},
 			})
 			if err != nil {

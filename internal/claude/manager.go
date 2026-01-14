@@ -56,9 +56,39 @@ func (m *ProcessManager) GetOrCreate(chatID int64) (*ClaudeProcess, error) {
 
 	// Create new process
 	m.logger.Info("creating new claude process", "chat_id", chatID)
-	newProc, err := NewProcess(m.claudePath, chatID, m.debug, m.skipPermissions, m.logger)
+	newProc, err := NewProcess(m.claudePath, chatID, m.debug, m.skipPermissions, "", m.logger)
 	if err != nil {
 		return nil, fmt.Errorf("creating process for chat %d: %w", chatID, err)
+	}
+
+	m.processes[chatID] = newProc
+	return newProc, nil
+}
+
+// GetOrCreateWithSession returns an existing process or creates one that resumes a specific session
+// If sessionID is empty, behaves like GetOrCreate (starts fresh)
+// If sessionID is provided, kills any existing process and starts a new one with --resume
+func (m *ProcessManager) GetOrCreateWithSession(chatID int64, sessionID string) (*ClaudeProcess, error) {
+	// If no session specified, use normal behavior
+	if sessionID == "" {
+		return m.GetOrCreate(chatID)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Kill existing process if any
+	if proc, exists := m.processes[chatID]; exists {
+		m.logger.Info("killing existing process for session switch", "chat_id", chatID)
+		proc.Close()
+		delete(m.processes, chatID)
+	}
+
+	// Create new process with resume flag
+	m.logger.Info("creating claude process with session", "chat_id", chatID, "session_id", sessionID)
+	newProc, err := NewProcess(m.claudePath, chatID, m.debug, m.skipPermissions, sessionID, m.logger)
+	if err != nil {
+		return nil, fmt.Errorf("creating process with session %s: %w", sessionID, err)
 	}
 
 	m.processes[chatID] = newProc

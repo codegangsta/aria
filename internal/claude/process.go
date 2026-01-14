@@ -45,7 +45,8 @@ type InitEvent struct {
 }
 
 // NewProcess creates and starts a new persistent Claude process
-func NewProcess(claudePath string, chatID int64, debug bool, skipPermissions bool, logger *slog.Logger) (*ClaudeProcess, error) {
+// If resumeSessionID is provided, the process will resume that session
+func NewProcess(claudePath string, chatID int64, debug bool, skipPermissions bool, resumeSessionID string, logger *slog.Logger) (*ClaudeProcess, error) {
 	args := []string{
 		"-p",
 		"--verbose",
@@ -55,6 +56,10 @@ func NewProcess(claudePath string, chatID int64, debug bool, skipPermissions boo
 
 	if skipPermissions {
 		args = append(args, "--dangerously-skip-permissions")
+	}
+
+	if resumeSessionID != "" {
+		args = append(args, "--resume", resumeSessionID)
 	}
 
 	cmd := exec.Command(claudePath, args...)

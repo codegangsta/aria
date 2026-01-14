@@ -28,10 +28,21 @@ type AskUserQuestionInput struct {
 
 // CallbackData stores callback information for keyboard buttons
 type CallbackData struct {
-	Type      string `json:"t"`           // "q" for question answer, "o" for other
-	ToolID    string `json:"id"`          // Tool use ID to respond to
-	QuestionIdx int  `json:"qi"`          // Which question (0-indexed)
-	OptionIdx int    `json:"oi,omitempty"` // Which option selected (for answer type)
+	Type        string `json:"t"`            // "q" for question, "o" for other, "s" for session
+	ToolID      string `json:"id,omitempty"` // Tool use ID to respond to
+	QuestionIdx int    `json:"qi,omitempty"` // Which question (0-indexed)
+	OptionIdx   int    `json:"oi,omitempty"` // Which option selected (for answer type)
+	SessionID   string `json:"s,omitempty"`  // Session ID (for session switching)
+	Action      string `json:"a,omitempty"`  // Action: "r" resume, "f" fresh
+}
+
+// SessionDisplayInfo contains info needed to display a session in the keyboard
+type SessionDisplayInfo struct {
+	ID          string // Full session UUID
+	ShortID     string // First 8 chars for callback
+	ProjectName string // Short project name
+	Summary     string // Session summary/topic
+	TimeAgo     string // Formatted relative time
 }
 
 // ParseAskUserQuestion parses the input map from an AskUserQuestion tool call
@@ -122,4 +133,50 @@ func ParseCallbackData(data string) (*CallbackData, error) {
 		return nil, err
 	}
 	return &cb, nil
+}
+
+// BuildSessionKeyboard creates an inline keyboard for session selection
+func BuildSessionKeyboard(sessions []SessionDisplayInfo) gotgbot.InlineKeyboardMarkup {
+	var rows [][]gotgbot.InlineKeyboardButton
+
+	for _, s := range sessions {
+		// Format label: "project · summary · time"
+		summary := s.Summary
+		if len(summary) > 25 {
+			summary = summary[:22] + "..."
+		}
+		label := fmt.Sprintf("%s · %s · %s", s.ProjectName, summary, s.TimeAgo)
+
+		callbackData := CallbackData{
+			Type:      "s",
+			SessionID: s.ShortID,
+			Action:    "r", // resume
+		}
+		data, _ := json.Marshal(callbackData)
+
+		rows = append(rows, []gotgbot.InlineKeyboardButton{
+			{
+				Text:         label,
+				CallbackData: string(data),
+			},
+		})
+	}
+
+	// Add "Start Fresh" button
+	freshData := CallbackData{
+		Type:   "s",
+		Action: "f", // fresh
+	}
+	freshDataBytes, _ := json.Marshal(freshData)
+
+	rows = append(rows, []gotgbot.InlineKeyboardButton{
+		{
+			Text:         "Start Fresh",
+			CallbackData: string(freshDataBytes),
+		},
+	})
+
+	return gotgbot.InlineKeyboardMarkup{
+		InlineKeyboard: rows,
+	}
 }
