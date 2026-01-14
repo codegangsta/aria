@@ -7,10 +7,13 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/codegangsta/aria/internal/claude"
 	"github.com/codegangsta/aria/internal/config"
@@ -19,14 +22,44 @@ import (
 
 // PendingQuestion stores context for an AskUserQuestion waiting for user input
 type PendingQuestion struct {
-	ToolID    string
-	Questions []telegram.Question
+	ToolID       string
+	Questions    []telegram.Question
+	CurrentIdx   int               // Which question we're on (0-indexed)
+	Answers      []string          // Collected answers so far
 }
+
+// Global vars for rebuild functionality
+var (
+	executablePath string // Path to current binary
+	sourceDir      string // Path to source directory for rebuilding
+)
 
 func main() {
 	configPath := flag.String("config", "", "path to config file")
 	claudePath := flag.String("claude", "claude", "path to claude binary")
+	sourceDirFlag := flag.String("source", "", "path to source directory (for /rebuild)")
 	flag.Parse()
+
+	// Get the path to the current executable
+	var err error
+	executablePath, err = os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to get executable path: %v\n", err)
+		os.Exit(1)
+	}
+	executablePath, _ = filepath.EvalSymlinks(executablePath) // Resolve symlinks
+
+	// Source directory for rebuilds - use flag, or try to infer from executable location
+	if *sourceDirFlag != "" {
+		sourceDir = *sourceDirFlag
+	} else {
+		// Default: assume source is in same directory as binary or one level up
+		sourceDir = filepath.Dir(executablePath)
+		// Check if go.mod exists here or parent
+		if _, err := os.Stat(filepath.Join(sourceDir, "go.mod")); os.IsNotExist(err) {
+			sourceDir = filepath.Dir(sourceDir)
+		}
+	}
 
 	// Find default paths
 	homeDir, err := os.UserHomeDir()
@@ -61,6 +94,16 @@ func main() {
 	// Create components
 	manager := claude.NewManager(*claudePath, cfg.Debug, cfg.Claude.SkipPermissions, slog.Default())
 	sessionDiscovery := claude.NewSessionDiscovery(homeDir+"/.claude", slog.Default())
+
+	// Set up session persistence
+	sessionsPath := homeDir + "/.config/aria/sessions.yaml"
+	persistence := claude.NewSessionPersistence(sessionsPath)
+	if err := persistence.Load(); err != nil {
+		slog.Warn("failed to load persisted sessions", "error", err)
+	} else {
+		slog.Info("loaded persisted sessions", "count", len(persistence.GetAll()))
+	}
+	manager.SetPersistence(persistence)
 
 	bot, err := telegram.New(cfg.Telegram.Token, cfg.Allowlist, cfg.Debug, slog.Default())
 	if err != nil {
@@ -141,6 +184,22 @@ func main() {
 			return
 		}
 
+		// Handle /rebuild - recompile and restart ARIA
+		if cmd == "/rebuild" {
+			slog.Info("rebuild requested", "chat_id", chatID)
+			respond("Rebuilding ARIA...", true)
+
+			// Run go build in background, then exec the new binary
+			go func() {
+				if err := rebuildAndRestart(manager); err != nil {
+					slog.Error("rebuild failed", "error", err)
+					bot.SendMessage(chatID, fmt.Sprintf("Rebuild failed: %v", err), false)
+				}
+				// If we get here, exec failed or wasn't called
+			}()
+			return
+		}
+
 		// Handle /sessions - show session picker keyboard
 		if cmd == "/sessions" {
 			slog.Info("showing sessions", "chat_id", chatID)
@@ -214,12 +273,14 @@ func main() {
 					// Store pending question for this chat
 					pendingMu.Lock()
 					pendingQuestions[chatID] = &PendingQuestion{
-						ToolID:    tool.ID,
-						Questions: parsed.Questions,
+						ToolID:     tool.ID,
+						Questions:  parsed.Questions,
+						CurrentIdx: 0,
+						Answers:    make([]string, 0, len(parsed.Questions)),
 					}
 					pendingMu.Unlock()
 
-					// Send keyboard for first question only (one at a time for now)
+					// Send keyboard for first question
 					if len(parsed.Questions) > 0 {
 						q := parsed.Questions[0]
 						keyboard, text := telegram.BuildQuestionKeyboard(tool.ID, 0, q)
@@ -369,21 +430,52 @@ func main() {
 		slog.Info("user selected option",
 			"chat_id", chatID,
 			"option", selectedOption.Label,
+			"question_idx", cb.QuestionIdx,
+			"total_questions", len(pending.Questions),
 		)
 
-		// Clear pending question
+		// Store this answer
+		pendingMu.Lock()
+		pending.Answers = append(pending.Answers, selectedOption.Label)
+		pending.CurrentIdx++
+		nextIdx := pending.CurrentIdx
+		totalQuestions := len(pending.Questions)
+		allAnswers := make([]string, len(pending.Answers))
+		copy(allAnswers, pending.Answers)
+		pendingMu.Unlock()
+
+		// Check if more questions remain
+		if nextIdx < totalQuestions {
+			// Send next question keyboard
+			nextQ := pending.Questions[nextIdx]
+			keyboard, text := telegram.BuildQuestionKeyboard(pending.ToolID, nextIdx, nextQ)
+			if err := bot.SendQuestionKeyboard(chatID, text, keyboard); err != nil {
+				slog.Error("failed to send next question keyboard", "error", err)
+			}
+			return "Selected: " + selectedOption.Label
+		}
+
+		// All questions answered - clear pending and send all answers to Claude
 		pendingMu.Lock()
 		delete(pendingQuestions, chatID)
 		pendingMu.Unlock()
 
-		// Send the selection back to Claude as a user message
-		// The selection is sent as plain text which Claude will interpret
+		// Format answers as a combined response
+		combinedAnswer := ""
+		for i, ans := range allAnswers {
+			if i > 0 {
+				combinedAnswer += ", "
+			}
+			combinedAnswer += ans
+		}
+
+		// Send the combined answers back to Claude
 		go func() {
 			// Start typing indicator
 			stopTyping := bot.TypingLoop(chatID)
 			defer stopTyping()
 
-			err := manager.Send(cbCtx, chatID, selectedOption.Label, claude.ResponseCallbacks{
+			err := manager.Send(cbCtx, chatID, combinedAnswer, claude.ResponseCallbacks{
 				OnMessage: func(text string, isFinal bool) {
 					silent := !isFinal
 
@@ -403,11 +495,13 @@ func main() {
 						}
 						pendingMu.Lock()
 						pendingQuestions[chatID] = &PendingQuestion{
-							ToolID:    tool.ID,
-							Questions: parsed.Questions,
+							ToolID:     tool.ID,
+							Questions:  parsed.Questions,
+							CurrentIdx: 0,
+							Answers:    make([]string, 0, len(parsed.Questions)),
 						}
 						pendingMu.Unlock()
-						// Send first question only (one at a time)
+						// Send first question
 						if len(parsed.Questions) > 0 {
 							q := parsed.Questions[0]
 							keyboard, text := telegram.BuildQuestionKeyboard(tool.ID, 0, q)
@@ -441,6 +535,21 @@ func main() {
 	})
 
 	slog.Info("aria started, connecting to telegram")
+
+	// Notify users with persisted sessions that ARIA has restarted
+	// This runs in background after bot starts polling
+	go func() {
+		// Small delay to let bot initialize
+		time.Sleep(500 * time.Millisecond)
+
+		sessions := persistence.GetAll()
+		if len(sessions) > 0 {
+			for chatID := range sessions {
+				slog.Info("notifying chat of restart", "chat_id", chatID)
+				bot.SendMessage(chatID, "ARIA restarted. Session will resume on next message.", true)
+			}
+		}
+	}()
 
 	// Start the bot (blocks until context is cancelled)
 	if err := bot.Start(ctx); err != nil {
@@ -477,4 +586,83 @@ func setupLogger(cfg *config.Config) {
 	opts := &slog.HandlerOptions{Level: level}
 	handler := slog.NewTextHandler(w, opts)
 	slog.SetDefault(slog.New(handler))
+}
+
+// rebuildAndRestart compiles the current source and exec's the new binary
+func rebuildAndRestart(manager *claude.ProcessManager) error {
+	slog.Info("starting rebuild",
+		"source_dir", sourceDir,
+		"executable", executablePath,
+	)
+
+	// Check that source directory has go.mod
+	goModPath := filepath.Join(sourceDir, "go.mod")
+	if _, err := os.Stat(goModPath); os.IsNotExist(err) {
+		return fmt.Errorf("no go.mod found in %s - set --source flag to aria source directory", sourceDir)
+	}
+
+	// Build the new binary to a temp location first
+	tempBinary := executablePath + ".new"
+	buildCmd := exec.Command("go", "build", "-o", tempBinary, "./cmd/aria")
+	buildCmd.Dir = sourceDir
+	buildCmd.Stdout = os.Stdout
+	buildCmd.Stderr = os.Stderr
+
+	slog.Info("running go build", "dir", sourceDir, "output", tempBinary)
+	if err := buildCmd.Run(); err != nil {
+		return fmt.Errorf("go build failed: %w", err)
+	}
+
+	// Replace the old binary with the new one
+	if err := os.Rename(tempBinary, executablePath); err != nil {
+		// Try copy if rename fails (cross-device)
+		if copyErr := copyFile(tempBinary, executablePath); copyErr != nil {
+			os.Remove(tempBinary)
+			return fmt.Errorf("failed to replace binary: %w", err)
+		}
+		os.Remove(tempBinary)
+	}
+
+	slog.Info("build successful, restarting...")
+
+	// Gracefully shutdown Claude processes
+	manager.Shutdown()
+
+	// Get current args to pass to new process
+	args := os.Args
+
+	// Exec the new binary - this replaces the current process
+	slog.Info("exec'ing new binary", "path", executablePath, "args", args)
+	if err := syscall.Exec(executablePath, args, os.Environ()); err != nil {
+		return fmt.Errorf("exec failed: %w", err)
+	}
+
+	// This line is never reached if exec succeeds
+	return nil
+}
+
+// copyFile copies a file from src to dst
+func copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	if _, err := io.Copy(destFile, sourceFile); err != nil {
+		return err
+	}
+
+	// Copy permissions
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	return os.Chmod(dst, info.Mode())
 }

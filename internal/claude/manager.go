@@ -15,6 +15,7 @@ type ProcessManager struct {
 	processes       map[int64]*ClaudeProcess
 	mu              sync.RWMutex
 	logger          *slog.Logger
+	persistence     *SessionPersistence
 }
 
 // NewManager creates a new ProcessManager
@@ -28,7 +29,13 @@ func NewManager(claudePath string, debug bool, skipPermissions bool, logger *slo
 	}
 }
 
+// SetPersistence sets the session persistence handler
+func (m *ProcessManager) SetPersistence(p *SessionPersistence) {
+	m.persistence = p
+}
+
 // GetOrCreate returns an existing process for the chat or creates a new one
+// If a persisted session ID exists, it will resume that session
 func (m *ProcessManager) GetOrCreate(chatID int64) (*ClaudeProcess, error) {
 	// Check if we have an existing process
 	m.mu.RLock()
@@ -54,9 +61,18 @@ func (m *ProcessManager) GetOrCreate(chatID int64) (*ClaudeProcess, error) {
 		delete(m.processes, chatID)
 	}
 
-	// Create new process
-	m.logger.Info("creating new claude process", "chat_id", chatID)
-	newProc, err := NewProcess(m.claudePath, chatID, m.debug, m.skipPermissions, "", m.logger)
+	// Check for persisted session ID to resume
+	var resumeSessionID string
+	if m.persistence != nil {
+		resumeSessionID = m.persistence.Get(chatID)
+		if resumeSessionID != "" {
+			m.logger.Info("resuming persisted session", "chat_id", chatID, "session_id", resumeSessionID)
+		}
+	}
+
+	// Create new process (with resume if we have a persisted session)
+	m.logger.Info("creating new claude process", "chat_id", chatID, "resume", resumeSessionID != "")
+	newProc, err := NewProcess(m.claudePath, chatID, m.debug, m.skipPermissions, resumeSessionID, m.logger)
 	if err != nil {
 		return nil, fmt.Errorf("creating process for chat %d: %w", chatID, err)
 	}
@@ -92,6 +108,12 @@ func (m *ProcessManager) GetOrCreateWithSession(chatID int64, sessionID string) 
 	}
 
 	m.processes[chatID] = newProc
+
+	// Persist this session ID so it survives restarts
+	if m.persistence != nil {
+		m.persistence.Set(chatID, sessionID)
+	}
+
 	return newProc, nil
 }
 
@@ -119,6 +141,13 @@ func (m *ProcessManager) Send(ctx context.Context, chatID int64, message string,
 		delete(m.processes, chatID)
 		m.mu.Unlock()
 		return fmt.Errorf("reading responses: %w", err)
+	}
+
+	// Persist session ID if we got one from init event
+	if m.persistence != nil {
+		if sessionID := proc.SessionID(); sessionID != "" {
+			m.persistence.Set(chatID, sessionID)
+		}
 	}
 
 	return nil
@@ -161,6 +190,7 @@ func (m *ProcessManager) GetSlashCommands() []string {
 }
 
 // Reset kills the Claude process for a chat, forcing a fresh one on next message
+// Also clears any persisted session so the next message starts fresh
 func (m *ProcessManager) Reset(chatID int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -169,5 +199,10 @@ func (m *ProcessManager) Reset(chatID int64) {
 		m.logger.Info("resetting claude process", "chat_id", chatID)
 		proc.Close()
 		delete(m.processes, chatID)
+	}
+
+	// Clear persisted session so next message starts fresh
+	if m.persistence != nil {
+		m.persistence.Delete(chatID)
 	}
 }

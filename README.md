@@ -21,7 +21,8 @@ Aria: Done! Added to your inbox.
 
 ## Features
 
-- **Persistent sessions** - Each chat maintains Claude context
+- **Persistent sessions** - Each chat maintains Claude context across restarts
+- **Session resumption** - Restart Aria without losing conversation history
 - **Typing indicators** - Shows "typing..." while Claude works
 - **Tool notifications** - See what Claude is doing (reading files, searching, etc.)
 - **Inline keyboards** - Interactive buttons for Claude's questions
@@ -112,6 +113,16 @@ make test       # Run tests
 make run        # Run locally
 ```
 
+## Session Management
+
+Sessions persist across restarts in `~/.config/aria/sessions.yaml`.
+
+**Commands:**
+- `/sessions` - List active sessions with their IDs
+- `/reset` - Clear current session and start fresh
+
+When Aria restarts, it automatically resumes your previous conversation using Claude's `--resume` flag. No context is lost.
+
 ## Troubleshooting
 
 **Bot not responding:**
@@ -122,6 +133,11 @@ make run        # Run locally
 **Claude errors:**
 - Verify Claude Code is authenticated: `claude --version`
 - Test manually: `echo "hello" | claude -p`
+
+**Session issues:**
+- Check `~/.config/aria/sessions.yaml` for stored sessions
+- Use `/reset` to clear a corrupted session
+- Delete `sessions.yaml` to reset all sessions
 
 ## License
 

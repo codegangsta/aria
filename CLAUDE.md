@@ -98,3 +98,44 @@ tail -f /tmp/aria.log
 **Claude errors:**
 - Check Claude Code is authenticated: `claude --version`
 - Test manually: `echo "hello" | claude -p`
+
+## Self-Development Workflow
+
+When working on Aria's own codebase (i.e., when Claude is modifying Aria):
+
+### Making Changes
+
+1. **Edit code** - Make changes to Go files as needed
+2. **Build** - Run `make build` to compile
+3. **Ask for restart** - Tell the user to run `make restart` (don't attempt to restart yourself)
+
+### Session Persistence
+
+Sessions survive restarts via `~/.config/aria/sessions.yaml`:
+- Each chat_id maps to a Claude session_id
+- On restart, Aria resumes the previous session with `--resume`
+- Use `/sessions` command to view/manage active sessions
+- Use `/reset` to clear session and start fresh
+
+### Testing Changes
+
+```bash
+# Build and test locally
+make build
+./aria --config config.example.yaml
+
+# Or rebuild the daemon
+make build
+make restart
+
+# Watch logs
+make logs
+```
+
+### After Rebuilding
+
+When Aria rebuilds itself:
+1. The build completes
+2. Aria tells the user: "Rebuilt! Run `make restart` to pick up changes."
+3. User restarts, session resumes automatically
+4. Aria continues with full context from before the restart

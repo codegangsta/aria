@@ -35,12 +35,14 @@ type ClaudeProcess struct {
 	debug         bool
 	logger        *slog.Logger
 	slashCommands []string // Commands discovered from init event
+	sessionID     string   // Session ID from init event
 }
 
 // InitEvent represents the system init event from Claude
 type InitEvent struct {
 	Type          string   `json:"type"`
 	Subtype       string   `json:"subtype"`
+	SessionID     string   `json:"session_id"`
 	SlashCommands []string `json:"slash_commands"`
 }
 
@@ -278,52 +280,68 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 			}
 		}
 
-		// Capture slash commands from init event (only once)
+		// Capture slash commands and session ID from init event (only once)
 		if event.Type == "system" && p.slashCommands == nil {
 			var initEvent InitEvent
 			if json.Unmarshal([]byte(line), &initEvent) == nil && initEvent.Subtype == "init" {
 				p.slashCommands = initEvent.SlashCommands
-				p.logger.Debug("captured slash commands",
-					"count", len(p.slashCommands),
-					"commands", p.slashCommands,
+				p.sessionID = initEvent.SessionID
+				p.logger.Debug("captured init data",
+					"session_id", p.sessionID,
+					"commands_count", len(p.slashCommands),
 				)
 			}
 		}
 
 		// Process assistant messages
 		if event.Type == "assistant" {
+			// Collect all text and tool_use from this event first
+			// so we can emit them in the correct order (text before tools)
+			var textBlocks []string
+			var toolBlocks []ContentBlock
+
 			for _, content := range event.Message.Content {
 				if content.Type == "text" && content.Text != "" {
-					// Text content means any pending tools have completed
-					completeAllPending()
-					// Flush previous message (it wasn't final)
-					flushBuffer()
-					// Buffer this message (might be final)
-					lastMessage = content.Text
-					hasMessage = true
+					textBlocks = append(textBlocks, content.Text)
 				}
 				if content.Type == "tool_use" && content.Name != "" {
-					// New tool_use means previous tools have completed
-					completeAllPending()
-					// Flush any pending text BEFORE emitting tool use
-					// This ensures text appears before tool notifications/keyboards
-					flushBuffer()
-					// Track this tool as pending
-					pendingTools[content.ID] = true
-					// Emit tool use event
-					if callbacks.OnToolUse != nil {
-						callbacks.OnToolUse(ToolUse{
-							ID:    content.ID,
-							Name:  content.Name,
-							Input: content.Input,
-						})
-					}
-					p.logger.Debug("tool use",
-						"tool", content.Name,
-						"id", content.ID,
-						"chat_id", p.chatID,
-					)
+					toolBlocks = append(toolBlocks, content)
 				}
+			}
+
+			// Process text blocks first (emit messages before tool notifications)
+			for _, text := range textBlocks {
+				// Text content means any pending tools have completed
+				completeAllPending()
+				// Flush previous message (it wasn't final)
+				flushBuffer()
+				// Buffer this message (might be final)
+				lastMessage = text
+				hasMessage = true
+			}
+
+			// Then process tool_use blocks
+			for _, content := range toolBlocks {
+				// New tool_use means previous tools have completed
+				completeAllPending()
+				// Flush any pending text BEFORE emitting tool use
+				// This ensures text appears before tool notifications/keyboards
+				flushBuffer()
+				// Track this tool as pending
+				pendingTools[content.ID] = true
+				// Emit tool use event
+				if callbacks.OnToolUse != nil {
+					callbacks.OnToolUse(ToolUse{
+						ID:    content.ID,
+						Name:  content.Name,
+						Input: content.Input,
+					})
+				}
+				p.logger.Debug("tool use",
+					"tool", content.Name,
+					"id", content.ID,
+					"chat_id", p.chatID,
+				)
 			}
 		}
 
@@ -389,6 +407,11 @@ func (p *ClaudeProcess) Alive() bool {
 // SlashCommands returns the slash commands discovered from the init event
 func (p *ClaudeProcess) SlashCommands() []string {
 	return p.slashCommands
+}
+
+// SessionID returns the session ID from the init event
+func (p *ClaudeProcess) SessionID() string {
+	return p.sessionID
 }
 
 // convertTelegramCommand converts a Telegram command (underscores) to Claude format (hyphens)

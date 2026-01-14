@@ -386,10 +386,13 @@ func (b *Bot) TypingLoop(chatID int64) func() {
 }
 
 // builtinCommands are Claude Code commands not exposed in the init event's slash_commands
+// Also includes ARIA-specific commands handled before Claude
 var builtinCommands = []string{
-	"clear",  // Clear conversation history
-	"help",   // Show help
-	"memory", // Edit CLAUDE.md
+	"clear",    // Clear conversation history
+	"help",     // Show help
+	"memory",   // Edit CLAUDE.md
+	"sessions", // Switch between Claude sessions
+	"rebuild",  // Rebuild and restart ARIA
 }
 
 // RegisterCommands registers slash commands with Telegram's command menu
