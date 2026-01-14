@@ -26,16 +26,18 @@ type UserContent struct {
 
 // ClaudeProcess represents a persistent Claude CLI process
 type ClaudeProcess struct {
-	cmd           *exec.Cmd
-	stdin         io.WriteCloser
-	stdout        io.ReadCloser
-	scanner       *bufio.Scanner
-	mu            sync.Mutex
-	chatID        int64
-	debug         bool
-	logger        *slog.Logger
-	slashCommands []string // Commands discovered from init event
-	sessionID     string   // Session ID from init event
+	cmd              *exec.Cmd
+	stdin            io.WriteCloser
+	stdout           io.ReadCloser
+	scanner          *bufio.Scanner
+	mu               sync.Mutex
+	chatID           int64
+	debug            bool
+	logger           *slog.Logger
+	slashCommands    []string // Commands discovered from init event
+	sessionID        string   // Session ID from init event
+	done             chan struct{} // Closed when process exits
+	sessionNotFound  bool     // True if resume failed due to missing session
 }
 
 // InitEvent represents the system init event from Claude
@@ -48,7 +50,8 @@ type InitEvent struct {
 
 // NewProcess creates and starts a new persistent Claude process
 // If resumeSessionID is provided, the process will resume that session
-func NewProcess(claudePath string, chatID int64, debug bool, skipPermissions bool, resumeSessionID string, logger *slog.Logger) (*ClaudeProcess, error) {
+// If cwd is provided, the process will start in that directory
+func NewProcess(claudePath string, chatID int64, debug bool, skipPermissions bool, resumeSessionID string, cwd string, logger *slog.Logger) (*ClaudeProcess, error) {
 	args := []string{
 		"-p",
 		"--verbose",
@@ -66,6 +69,11 @@ func NewProcess(claudePath string, chatID int64, debug bool, skipPermissions boo
 
 	cmd := exec.Command(claudePath, args...)
 
+	// Set working directory if specified
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
+
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("creating stdin pipe: %w", err)
@@ -77,9 +85,18 @@ func NewProcess(claudePath string, chatID int64, debug bool, skipPermissions boo
 		return nil, fmt.Errorf("creating stdout pipe: %w", err)
 	}
 
+	// Capture stderr to detect session resume failures
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		stdin.Close()
+		stdout.Close()
+		return nil, fmt.Errorf("creating stderr pipe: %w", err)
+	}
+
 	if err := cmd.Start(); err != nil {
 		stdin.Close()
 		stdout.Close()
+		stderr.Close()
 		return nil, fmt.Errorf("starting claude: %w", err)
 	}
 
@@ -88,7 +105,8 @@ func NewProcess(claudePath string, chatID int64, debug bool, skipPermissions boo
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
 
-	return &ClaudeProcess{
+	done := make(chan struct{})
+	proc := &ClaudeProcess{
 		cmd:     cmd,
 		stdin:   stdin,
 		stdout:  stdout,
@@ -96,7 +114,35 @@ func NewProcess(claudePath string, chatID int64, debug bool, skipPermissions boo
 		chatID:  chatID,
 		debug:   debug,
 		logger:  logger,
-	}, nil
+		done:    done,
+	}
+
+	// Monitor stderr for session not found warning and process exit
+	go func() {
+		stderrScanner := bufio.NewScanner(stderr)
+		for stderrScanner.Scan() {
+			line := stderrScanner.Text()
+			if strings.Contains(line, "No conversation found with session ID") {
+				proc.mu.Lock()
+				proc.sessionNotFound = true
+				proc.mu.Unlock()
+				logger.Warn("session not found, will use new session",
+					"chat_id", chatID,
+					"stderr", line,
+				)
+			} else if line != "" {
+				logger.Debug("claude stderr", "chat_id", chatID, "line", line)
+			}
+		}
+	}()
+
+	// Monitor process exit and close done channel
+	go func() {
+		cmd.Wait()
+		close(done)
+	}()
+
+	return proc, nil
 }
 
 // SilentCommand represents a command that doesn't produce assistant output
@@ -203,11 +249,13 @@ type TodoEvent struct {
 
 // ResponseCallbacks holds callbacks for different response types
 type ResponseCallbacks struct {
-	OnMessage      func(text string, isFinal bool)
-	OnToolUse      func(tool ToolUse)
-	OnToolResult   func(result ToolResult) // Called when a tool completes (success or failure)
-	OnInputRequest func(toolID string)     // Called when Claude needs user input (e.g., AskUserQuestion)
-	OnTodoUpdate   func(todos []Todo)      // Called when Claude updates todos via TodoWrite
+	OnMessage           func(text string, isFinal bool)
+	OnToolUse           func(tool ToolUse)
+	OnToolResult        func(result ToolResult) // Called when a tool completes (success or failure)
+	OnInputRequest      func(toolID string)     // Called when Claude needs user input (e.g., AskUserQuestion)
+	OnTodoUpdate        func(todos []Todo)      // Called when Claude updates todos via TodoWrite
+	OnToolError         func(toolName string, errorMsg string) // Called when a tool returns an error
+	OnPermissionDenial  func(denials []string)  // Called when permissions are denied
 }
 
 // ToolResultEvent represents an event containing tool result information
@@ -216,6 +264,35 @@ type ToolResultEvent struct {
 	Subtype   string `json:"subtype,omitempty"`
 	ToolUseID string `json:"tool_use_id,omitempty"`
 	IsError   bool   `json:"is_error,omitempty"`
+}
+
+// UserEvent represents a user event that may contain tool results
+type UserEvent struct {
+	Type          string       `json:"type"`
+	Message       UserEventMsg `json:"message,omitempty"`
+	ToolUseResult string       `json:"tool_use_result,omitempty"` // Error message if tool failed
+}
+
+// UserEventMsg represents the message content in a user event
+type UserEventMsg struct {
+	Role    string            `json:"role"`
+	Content []UserEventContent `json:"content,omitempty"`
+}
+
+// UserEventContent represents content in a user event message
+type UserEventContent struct {
+	Type      string `json:"type"`
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	Content   string `json:"content,omitempty"`
+	IsError   bool   `json:"is_error,omitempty"`
+}
+
+// ResultEvent represents the final result event from Claude
+type ResultEvent struct {
+	Type              string   `json:"type"`
+	Subtype           string   `json:"subtype,omitempty"`
+	IsError           bool     `json:"is_error,omitempty"`
+	PermissionDenials []string `json:"permission_denials,omitempty"`
 }
 
 // ReadResponses reads stream-json responses and calls callbacks for assistant text and tool use
@@ -307,6 +384,33 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 			}
 		}
 
+		// Check for tool errors in user events (tool_result with is_error: true)
+		if event.Type == "user" {
+			var userEvent UserEvent
+			if json.Unmarshal([]byte(line), &userEvent) == nil {
+				for _, content := range userEvent.Message.Content {
+					if content.Type == "tool_result" && content.IsError {
+						// Mark tool as failed in tracker
+						completeTool(content.ToolUseID, true)
+
+						// Extract error message - prefer content field, fall back to top-level
+						errorMsg := content.Content
+						if errorMsg == "" && userEvent.ToolUseResult != "" {
+							errorMsg = userEvent.ToolUseResult
+						}
+						if errorMsg != "" && callbacks.OnToolError != nil {
+							p.logger.Debug("tool error detected",
+								"tool_id", content.ToolUseID,
+								"error", errorMsg,
+								"chat_id", p.chatID,
+							)
+							callbacks.OnToolError(content.ToolUseID, errorMsg)
+						}
+					}
+				}
+			}
+		}
+
 		// Process assistant messages
 		if event.Type == "assistant" {
 			// Collect all text and tool_use from this event first
@@ -389,6 +493,19 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 		if event.Type == "result" {
 			// Complete any remaining pending tools
 			completeAllPending()
+
+			// Check for permission denials
+			var resultEvent ResultEvent
+			if json.Unmarshal([]byte(line), &resultEvent) == nil {
+				if len(resultEvent.PermissionDenials) > 0 && callbacks.OnPermissionDenial != nil {
+					p.logger.Info("permission denials in result",
+						"chat_id", p.chatID,
+						"denials", resultEvent.PermissionDenials,
+					)
+					callbacks.OnPermissionDenial(resultEvent.PermissionDenials)
+				}
+			}
+
 			p.logger.Debug("result received, response complete",
 				"chat_id", p.chatID,
 				"has_final_message", hasMessage,
@@ -432,7 +549,18 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 		return fmt.Errorf("reading claude output: %w", err)
 	}
 
-	return nil
+	// Scanner finished without result event - process likely died
+	select {
+	case <-p.done:
+		// Process exited - check if it was due to session not found
+		if p.SessionNotFound() {
+			return fmt.Errorf("session not found, needs fresh start")
+		}
+		return fmt.Errorf("claude process exited unexpectedly")
+	default:
+		// Process still running but no more output - unusual
+		return fmt.Errorf("claude output ended without result event")
+	}
 }
 
 // Alive checks if the process is still running
@@ -452,6 +580,18 @@ func (p *ClaudeProcess) SlashCommands() []string {
 // SessionID returns the session ID from the init event
 func (p *ClaudeProcess) SessionID() string {
 	return p.sessionID
+}
+
+// SessionNotFound returns true if the session resume failed because the session doesn't exist
+func (p *ClaudeProcess) SessionNotFound() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.sessionNotFound
+}
+
+// Done returns a channel that's closed when the process exits
+func (p *ClaudeProcess) Done() <-chan struct{} {
+	return p.done
 }
 
 // convertTelegramCommand converts a Telegram command (underscores) to Claude format (hyphens)

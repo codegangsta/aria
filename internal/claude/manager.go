@@ -61,18 +61,20 @@ func (m *ProcessManager) GetOrCreate(chatID int64) (*ClaudeProcess, error) {
 		delete(m.processes, chatID)
 	}
 
-	// Check for persisted session ID to resume
+	// Check for persisted session ID and cwd to resume
 	var resumeSessionID string
+	var cwd string
 	if m.persistence != nil {
 		resumeSessionID = m.persistence.Get(chatID)
+		cwd = m.persistence.GetCwd(chatID)
 		if resumeSessionID != "" {
-			m.logger.Info("resuming persisted session", "chat_id", chatID, "session_id", resumeSessionID)
+			m.logger.Info("resuming persisted session", "chat_id", chatID, "session_id", resumeSessionID, "cwd", cwd)
 		}
 	}
 
 	// Create new process (with resume if we have a persisted session)
-	m.logger.Info("creating new claude process", "chat_id", chatID, "resume", resumeSessionID != "")
-	newProc, err := NewProcess(m.claudePath, chatID, m.debug, m.skipPermissions, resumeSessionID, m.logger)
+	m.logger.Info("creating new claude process", "chat_id", chatID, "resume", resumeSessionID != "", "cwd", cwd)
+	newProc, err := NewProcess(m.claudePath, chatID, m.debug, m.skipPermissions, resumeSessionID, cwd, m.logger)
 	if err != nil {
 		return nil, fmt.Errorf("creating process for chat %d: %w", chatID, err)
 	}
@@ -100,9 +102,15 @@ func (m *ProcessManager) GetOrCreateWithSession(chatID int64, sessionID string) 
 		delete(m.processes, chatID)
 	}
 
+	// Get cwd from persistence (preserve across session switches)
+	var cwd string
+	if m.persistence != nil {
+		cwd = m.persistence.GetCwd(chatID)
+	}
+
 	// Create new process with resume flag
-	m.logger.Info("creating claude process with session", "chat_id", chatID, "session_id", sessionID)
-	newProc, err := NewProcess(m.claudePath, chatID, m.debug, m.skipPermissions, sessionID, m.logger)
+	m.logger.Info("creating claude process with session", "chat_id", chatID, "session_id", sessionID, "cwd", cwd)
+	newProc, err := NewProcess(m.claudePath, chatID, m.debug, m.skipPermissions, sessionID, cwd, m.logger)
 	if err != nil {
 		return nil, fmt.Errorf("creating process with session %s: %w", sessionID, err)
 	}
@@ -119,7 +127,13 @@ func (m *ProcessManager) GetOrCreateWithSession(chatID int64, sessionID string) 
 
 // Send sends a message to the Claude process for a chat and reads the responses
 // The callbacks struct contains handlers for text messages and tool use events
+// If the process dies mid-conversation, it will automatically retry by resuming the session
 func (m *ProcessManager) Send(ctx context.Context, chatID int64, message string, callbacks ResponseCallbacks) error {
+	return m.sendWithRetry(ctx, chatID, message, callbacks, 1)
+}
+
+// sendWithRetry attempts to send a message, retrying once if the process dies
+func (m *ProcessManager) sendWithRetry(ctx context.Context, chatID int64, message string, callbacks ResponseCallbacks, retriesLeft int) error {
 	proc, err := m.GetOrCreate(chatID)
 	if err != nil {
 		return err
@@ -127,10 +141,19 @@ func (m *ProcessManager) Send(ctx context.Context, chatID int64, message string,
 
 	// Send the message
 	if err := proc.Send(message); err != nil {
-		// Process may have died, remove it and let next message create a new one
+		// Process may have died, remove it
 		m.mu.Lock()
 		delete(m.processes, chatID)
 		m.mu.Unlock()
+
+		// Retry if we have retries left
+		if retriesLeft > 0 {
+			m.logger.Info("send failed, retrying",
+				"chat_id", chatID,
+				"error", err,
+			)
+			return m.sendWithRetry(ctx, chatID, message, callbacks, retriesLeft-1)
+		}
 		return fmt.Errorf("sending message: %w", err)
 	}
 
@@ -140,13 +163,30 @@ func (m *ProcessManager) Send(ctx context.Context, chatID int64, message string,
 		m.mu.Lock()
 		delete(m.processes, chatID)
 		m.mu.Unlock()
+
+		// Check if session was not found - clear it from persistence
+		if proc.SessionNotFound() && m.persistence != nil {
+			m.logger.Info("clearing stale session",
+				"chat_id", chatID,
+			)
+			m.persistence.Delete(chatID)
+		}
+
+		// Retry if we have retries left
+		if retriesLeft > 0 {
+			m.logger.Info("read failed, retrying",
+				"chat_id", chatID,
+				"error", err,
+			)
+			return m.sendWithRetry(ctx, chatID, message, callbacks, retriesLeft-1)
+		}
 		return fmt.Errorf("reading responses: %w", err)
 	}
 
 	// Persist session ID if we got one from init event
 	if m.persistence != nil {
-		if sessionID := proc.SessionID(); sessionID != "" {
-			m.persistence.Set(chatID, sessionID)
+		if newSessionID := proc.SessionID(); newSessionID != "" {
+			m.persistence.Set(chatID, newSessionID)
 		}
 	}
 
@@ -205,4 +245,31 @@ func (m *ProcessManager) Reset(chatID int64) {
 	if m.persistence != nil {
 		m.persistence.Delete(chatID)
 	}
+}
+
+// SetCwd changes the working directory for a chat
+// This kills the current process but preserves the session for resume
+func (m *ProcessManager) SetCwd(chatID int64, cwd string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Kill existing process
+	if proc, exists := m.processes[chatID]; exists {
+		m.logger.Info("killing process for cwd change", "chat_id", chatID, "new_cwd", cwd)
+		proc.Close()
+		delete(m.processes, chatID)
+	}
+
+	// Set new cwd while preserving session for resume
+	if m.persistence != nil {
+		m.persistence.SetCwdPreserveSession(chatID, cwd)
+	}
+}
+
+// GetCwd returns the current working directory for a chat
+func (m *ProcessManager) GetCwd(chatID int64) string {
+	if m.persistence != nil {
+		return m.persistence.GetCwd(chatID)
+	}
+	return ""
 }

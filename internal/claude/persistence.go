@@ -14,6 +14,7 @@ import (
 type SessionMapping struct {
 	ChatID     int64     `yaml:"chat_id"`
 	SessionID  string    `yaml:"session_id"`
+	Cwd        string    `yaml:"cwd,omitempty"`
 	LastActive time.Time `yaml:"last_active"`
 }
 
@@ -97,18 +98,46 @@ func (p *SessionPersistence) Save() error {
 	return nil
 }
 
-// Set stores a session mapping for a chat
+// Set stores a session mapping for a chat (preserves existing cwd)
 func (p *SessionPersistence) Set(chatID int64, sessionID string) {
 	p.mu.Lock()
+	existing := p.sessions[chatID]
 	p.sessions[chatID] = SessionMapping{
 		ChatID:     chatID,
 		SessionID:  sessionID,
+		Cwd:        existing.Cwd, // Preserve existing cwd
 		LastActive: time.Now(),
 	}
 	p.mu.Unlock()
 
 	// Save in background (don't block)
 	go p.Save()
+}
+
+// SetCwd stores the working directory for a chat (preserves existing session)
+func (p *SessionPersistence) SetCwd(chatID int64, cwd string) {
+	p.mu.Lock()
+	existing := p.sessions[chatID]
+	p.sessions[chatID] = SessionMapping{
+		ChatID:     chatID,
+		SessionID:  existing.SessionID, // Preserve existing session
+		Cwd:        cwd,
+		LastActive: time.Now(),
+	}
+	p.mu.Unlock()
+
+	go p.Save()
+}
+
+// GetCwd returns the working directory for a chat, or empty string if none
+func (p *SessionPersistence) GetCwd(chatID int64) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if mapping, ok := p.sessions[chatID]; ok {
+		return mapping.Cwd
+	}
+	return ""
 }
 
 // Get returns the session ID for a chat, or empty string if none
@@ -126,6 +155,21 @@ func (p *SessionPersistence) Get(chatID int64) string {
 func (p *SessionPersistence) Delete(chatID int64) {
 	p.mu.Lock()
 	delete(p.sessions, chatID)
+	p.mu.Unlock()
+
+	go p.Save()
+}
+
+// SetCwdPreserveSession sets the cwd while preserving the existing session
+func (p *SessionPersistence) SetCwdPreserveSession(chatID int64, cwd string) {
+	p.mu.Lock()
+	existing := p.sessions[chatID]
+	p.sessions[chatID] = SessionMapping{
+		ChatID:     chatID,
+		SessionID:  existing.SessionID, // Preserve session for resume
+		Cwd:        cwd,
+		LastActive: time.Now(),
+	}
 	p.mu.Unlock()
 
 	go p.Save()

@@ -229,6 +229,60 @@ func main() {
 			return
 		}
 
+		// Handle /cd - change working directory
+		if cmd == "/cd" {
+			parts := strings.SplitN(text, " ", 2)
+			if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+				// No path provided - show current cwd
+				currentCwd := manager.GetCwd(chatID)
+				if currentCwd == "" {
+					currentCwd = "(default)"
+				}
+				respond(fmt.Sprintf("Working directory: %s", currentCwd), true)
+				return
+			}
+
+			// Expand ~ to home directory
+			newCwd := strings.TrimSpace(parts[1])
+			if strings.HasPrefix(newCwd, "~") {
+				newCwd = strings.Replace(newCwd, "~", homeDir, 1)
+			}
+
+			// Resolve to absolute path
+			newCwd, err := filepath.Abs(newCwd)
+			if err != nil {
+				respond(fmt.Sprintf("Invalid path: %v", err), false)
+				return
+			}
+
+			// Validate path exists and is a directory
+			info, err := os.Stat(newCwd)
+			if err != nil {
+				if os.IsNotExist(err) {
+					respond(fmt.Sprintf("Directory not found: %s", newCwd), false)
+				} else {
+					respond(fmt.Sprintf("Error checking path: %v", err), false)
+				}
+				return
+			}
+			if !info.IsDir() {
+				respond(fmt.Sprintf("Not a directory: %s", newCwd), false)
+				return
+			}
+
+			// Change the cwd (kills process, preserves session)
+			slog.Info("changing cwd", "chat_id", chatID, "cwd", newCwd)
+			manager.SetCwd(chatID, newCwd)
+
+			// Format display path (collapse home dir back to ~)
+			displayPath := newCwd
+			if strings.HasPrefix(newCwd, homeDir) {
+				displayPath = "~" + strings.TrimPrefix(newCwd, homeDir)
+			}
+			respond(fmt.Sprintf("Now working in %s", displayPath), false)
+			return
+		}
+
 		// Handle /sessions - show session picker keyboard
 		if cmd == "/sessions" {
 			slog.Info("showing sessions", "chat_id", chatID)
@@ -363,6 +417,21 @@ func main() {
 			OnToolResult: func(result claude.ToolResult) {
 				tracker := getOrCreateTracker(chatID)
 				tracker.CompleteTool(result.ToolID, result.IsError)
+			},
+			OnToolError: func(toolID string, errorMsg string) {
+				// Just log - the ✗ in tool tracker is enough visual indication
+				slog.Debug("tool error",
+					"chat_id", chatID,
+					"tool_id", toolID,
+					"error", errorMsg,
+				)
+			},
+			OnPermissionDenial: func(denials []string) {
+				// Just log for now - Phase 10 will add interactive permission handling
+				slog.Warn("permission denials",
+					"chat_id", chatID,
+					"denials", denials,
+				)
 			},
 		})
 
@@ -585,6 +654,21 @@ func main() {
 				OnToolResult: func(result claude.ToolResult) {
 					tracker := getOrCreateTracker(chatID)
 					tracker.CompleteTool(result.ToolID, result.IsError)
+				},
+				OnToolError: func(toolID string, errorMsg string) {
+					// Just log - the ✗ in tool tracker is enough visual indication
+					slog.Debug("tool error in callback",
+						"chat_id", chatID,
+						"tool_id", toolID,
+						"error", errorMsg,
+					)
+				},
+				OnPermissionDenial: func(denials []string) {
+					// Just log for now - Phase 10 will add interactive permission handling
+					slog.Warn("permission denials in callback",
+						"chat_id", chatID,
+						"denials", denials,
+					)
 				},
 			})
 			// Clear the trackers after response
