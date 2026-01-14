@@ -105,7 +105,7 @@ func (p *ProgressTracker) completeLocked() {
 
 	// Update to show completion
 	total := len(p.todos)
-	text := fmt.Sprintf("✅ Done (%d/%d)", total, total)
+	text := fmt.Sprintf("● Done (%d/%d)", total, total)
 	p.bot.EditMessageMarkdownV2(p.chatID, p.messageID, FormatMarkdownV2(text))
 
 	// Unpin
@@ -141,7 +141,7 @@ func (p *ProgressTracker) Cancel(reason string) {
 		return
 	}
 
-	text := "❌ Stopped"
+	text := "✕ Stopped"
 	if reason != "" {
 		text += ": " + reason
 	}
@@ -170,17 +170,17 @@ func (p *ProgressTracker) formatProgress() string {
 	total := len(p.todos)
 
 	// Build message
-	lines := []string{fmt.Sprintf("📋 Progress (%d/%d)", completed, total)}
+	lines := []string{fmt.Sprintf("(%d/%d)", completed, total)}
 
 	for _, t := range p.todos {
 		var icon string
 		var text string
 		switch t.Status {
 		case "completed":
-			icon = "✅"
+			icon = "●"
 			text = t.Content
 		case "in_progress":
-			icon = "⏳"
+			icon = "◐"
 			// Use activeForm if available for in-progress items
 			if t.ActiveForm != "" {
 				text = t.ActiveForm
@@ -188,7 +188,7 @@ func (p *ProgressTracker) formatProgress() string {
 				text = t.Content
 			}
 		default: // pending
-			icon = "⬜"
+			icon = "○"
 			text = t.Content
 		}
 		lines = append(lines, fmt.Sprintf("%s %s", icon, text))

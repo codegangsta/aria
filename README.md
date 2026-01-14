@@ -25,9 +25,11 @@ Aria: Done! Added to your inbox.
 - **Session resumption** - Restart Aria without losing conversation history
 - **Typing indicators** - Shows "typing..." while Claude works
 - **Tool notifications** - See what Claude is doing (reading files, searching, etc.)
+- **Todo progress display** - Pinned messages show multi-step task progress (○ → ◐ → ●)
 - **Inline keyboards** - Interactive buttons for Claude's questions
+- **Self-rebuild** - `/rebuild` compiles and restarts Aria from Telegram
 - **Slash commands** - All your Claude skills available as `/commands`
-- **HTML formatting** - Rich text responses
+- **MarkdownV2 formatting** - Rich text responses
 
 ## Prerequisites
 
@@ -118,8 +120,9 @@ make run        # Run locally
 Sessions persist across restarts in `~/.config/aria/sessions.yaml`.
 
 **Commands:**
-- `/sessions` - List active sessions with their IDs
+- `/sessions` - List active sessions with inline keyboard to switch
 - `/reset` - Clear current session and start fresh
+- `/rebuild` - Recompile Aria and restart (for self-development)
 
 When Aria restarts, it automatically resumes your previous conversation using Claude's `--resume` flag. No context is lost.
 
