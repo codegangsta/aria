@@ -4,21 +4,16 @@ import (
 	"fmt"
 	"sync"
 	"time"
-)
 
-// Todo represents a single todo item from Claude's TodoWrite
-type Todo struct {
-	Content    string `json:"content"`
-	Status     string `json:"status"` // "pending", "in_progress", "completed"
-	ActiveForm string `json:"activeForm"`
-}
+	"github.com/codegangsta/aria/internal/types"
+)
 
 // ProgressTracker manages a pinned progress message for todo items
 type ProgressTracker struct {
 	bot       *Bot
 	chatID    int64
 	messageID int64 // pinned message ID (0 if none)
-	todos     []Todo
+	todos     []types.Todo
 	mu        sync.Mutex
 
 	// Debouncing
@@ -37,7 +32,7 @@ func NewProgressTracker(bot *Bot, chatID int64) *ProgressTracker {
 }
 
 // Update updates the todo list and refreshes the pinned message
-func (p *ProgressTracker) Update(todos []Todo) {
+func (p *ProgressTracker) Update(todos []types.Todo) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -158,7 +153,7 @@ func (p *ProgressTracker) formatProgress() string {
 
 	// Count stats
 	completed := 0
-	var inProgressItem *Todo
+	var inProgressItem *types.Todo
 	for i := range p.todos {
 		if p.todos[i].Status == "completed" {
 			completed++

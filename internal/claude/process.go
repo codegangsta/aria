@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+
+	"github.com/codegangsta/aria/internal/types"
 )
 
 // UserMessage represents the stream-json input format for Claude
@@ -34,10 +36,11 @@ type ClaudeProcess struct {
 	chatID           int64
 	debug            bool
 	logger           *slog.Logger
-	slashCommands    []string // Commands discovered from init event
-	sessionID        string   // Session ID from init event
+	slashCommands    []string      // Commands discovered from init event
+	sessionID        string        // Session ID from init event
 	done             chan struct{} // Closed when process exits
-	sessionNotFound  bool     // True if resume failed due to missing session
+	sessionNotFound  bool          // True if resume failed due to missing session
+	closing          bool          // True when Close() has been called
 }
 
 // InitEvent represents the system init event from Claude
@@ -215,47 +218,27 @@ func (p *ClaudeProcess) Send(message string) error {
 	return nil
 }
 
-// ToolUse represents a tool call from Claude
-type ToolUse struct {
-	ID    string
-	Name  string
-	Input map[string]interface{}
-}
-
 // InputRequestEvent represents an input_request event from Claude
 type InputRequestEvent struct {
 	Type   string `json:"type"`
 	ToolID string `json:"tool_use_id"`
 }
 
-// ToolResult represents the result of a tool execution
-type ToolResult struct {
-	ToolID  string
-	IsError bool
-}
-
-// Todo represents a single todo item from Claude's TodoWrite
-type Todo struct {
-	Content    string `json:"content"`
-	Status     string `json:"status"` // "pending", "in_progress", "completed"
-	ActiveForm string `json:"activeForm"`
-}
-
 // TodoEvent represents a todo update event from Claude
 type TodoEvent struct {
-	Type  string `json:"type"`
-	Todos []Todo `json:"todos"`
+	Type  string       `json:"type"`
+	Todos []types.Todo `json:"todos"`
 }
 
 // ResponseCallbacks holds callbacks for different response types
 type ResponseCallbacks struct {
-	OnMessage           func(text string, isFinal bool)
-	OnToolUse           func(tool ToolUse)
-	OnToolResult        func(result ToolResult) // Called when a tool completes (success or failure)
-	OnInputRequest      func(toolID string)     // Called when Claude needs user input (e.g., AskUserQuestion)
-	OnTodoUpdate        func(todos []Todo)      // Called when Claude updates todos via TodoWrite
-	OnToolError         func(toolName string, errorMsg string) // Called when a tool returns an error
-	OnPermissionDenial  func(denials []string)  // Called when permissions are denied
+	OnMessage          func(text string, isFinal bool)
+	OnToolUse          func(tool types.ToolUse)
+	OnToolResult       func(result types.ToolResult) // Called when a tool completes (success or failure)
+	OnInputRequest     func(toolID string)           // Called when Claude needs user input (e.g., AskUserQuestion)
+	OnTodoUpdate       func(todos []types.Todo)      // Called when Claude updates todos via TodoWrite
+	OnToolError        func(toolName string, errorMsg string) // Called when a tool returns an error
+	OnPermissionDenial func(denials []string)        // Called when permissions are denied
 }
 
 // ToolResultEvent represents an event containing tool result information
@@ -319,7 +302,7 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 	// Helper to complete a specific tool with success/failure
 	completeTool := func(toolID string, isError bool) {
 		if pendingTools[toolID] && callbacks.OnToolResult != nil {
-			callbacks.OnToolResult(ToolResult{
+			callbacks.OnToolResult(types.ToolResult{
 				ToolID:  toolID,
 				IsError: isError,
 			})
@@ -331,7 +314,7 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 	completeAllPending := func() {
 		for toolID := range pendingTools {
 			if callbacks.OnToolResult != nil {
-				callbacks.OnToolResult(ToolResult{
+				callbacks.OnToolResult(types.ToolResult{
 					ToolID:  toolID,
 					IsError: false,
 				})
@@ -452,10 +435,10 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 				if content.Name == "TodoWrite" && callbacks.OnTodoUpdate != nil {
 					if todosRaw, ok := content.Input["todos"]; ok {
 						if todosSlice, ok := todosRaw.([]interface{}); ok {
-							todos := make([]Todo, 0, len(todosSlice))
+							todos := make([]types.Todo, 0, len(todosSlice))
 							for _, t := range todosSlice {
 								if todoMap, ok := t.(map[string]interface{}); ok {
-									todo := Todo{}
+									todo := types.Todo{}
 									if c, ok := todoMap["content"].(string); ok {
 										todo.Content = c
 									}
@@ -475,7 +458,7 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 
 				// Emit tool use event
 				if callbacks.OnToolUse != nil {
-					callbacks.OnToolUse(ToolUse{
+					callbacks.OnToolUse(types.ToolUse{
 						ID:    content.ID,
 						Name:  content.Name,
 						Input: content.Input,
@@ -528,7 +511,7 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 				// Complete any pending tools (except the one waiting for input)
 				for toolID := range pendingTools {
 					if toolID != inputReq.ToolID && callbacks.OnToolResult != nil {
-						callbacks.OnToolResult(ToolResult{
+						callbacks.OnToolResult(types.ToolResult{
 							ToolID:  toolID,
 							IsError: false,
 						})
@@ -546,19 +529,30 @@ func (p *ClaudeProcess) ReadResponses(ctx context.Context, callbacks ResponseCal
 	}
 
 	if err := p.scanner.Err(); err != nil {
+		// Don't report error if we're intentionally closing
+		if p.isClosing() {
+			return nil
+		}
 		return fmt.Errorf("reading claude output: %w", err)
 	}
 
 	// Scanner finished without result event - process likely died
 	select {
 	case <-p.done:
-		// Process exited - check if it was due to session not found
+		// Process exited - check if it was intentional
+		if p.isClosing() {
+			return nil
+		}
+		// Check if it was due to session not found
 		if p.SessionNotFound() {
 			return fmt.Errorf("session not found, needs fresh start")
 		}
 		return fmt.Errorf("claude process exited unexpectedly")
 	default:
 		// Process still running but no more output - unusual
+		if p.isClosing() {
+			return nil
+		}
 		return fmt.Errorf("claude output ended without result event")
 	}
 }
@@ -614,7 +608,8 @@ func convertTelegramCommand(message string) string {
 // Close gracefully closes the Claude process
 func (p *ClaudeProcess) Close() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.closing = true
+	p.mu.Unlock()
 
 	var errs []error
 
@@ -639,4 +634,11 @@ func (p *ClaudeProcess) Close() error {
 		return errs[0]
 	}
 	return nil
+}
+
+// isClosing returns true if Close() has been called
+func (p *ClaudeProcess) isClosing() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closing
 }

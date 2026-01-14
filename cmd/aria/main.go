@@ -7,26 +7,18 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/codegangsta/aria/internal/claude"
+	"github.com/codegangsta/aria/internal/commands"
 	"github.com/codegangsta/aria/internal/config"
+	"github.com/codegangsta/aria/internal/handlers"
 	"github.com/codegangsta/aria/internal/telegram"
+	"github.com/codegangsta/aria/internal/trackers"
 )
-
-// PendingQuestion stores context for an AskUserQuestion waiting for user input
-type PendingQuestion struct {
-	ToolID       string
-	Questions    []telegram.Question
-	CurrentIdx   int               // Which question we're on (0-indexed)
-	Answers      []string          // Collected answers so far
-}
 
 // Global vars for rebuild functionality
 var (
@@ -111,69 +103,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Pending questions waiting for user input (chatID -> PendingQuestion)
-	pendingQuestions := make(map[int64]*PendingQuestion)
-	var pendingMu sync.RWMutex
+	// Set up command router
+	cmdRouter := commands.NewRouter()
+	cmdRouter.Register(commands.NewClearCommand(manager))
+	cmdRouter.Register(commands.NewCdCommand(manager, homeDir))
+	cmdRouter.Register(commands.NewSessionsCommand(sessionDiscovery, bot))
+	cmdRouter.Register(commands.NewRebuildCommand(manager, bot, sourceDir, executablePath))
 
-	// Tool status trackers for consolidated tool notifications (chatID -> tracker)
-	toolTrackers := make(map[int64]*telegram.ToolStatusTracker)
-	var trackersMu sync.Mutex
-
-	// Progress trackers for todo display (chatID -> tracker)
-	progressTrackers := make(map[int64]*telegram.ProgressTracker)
-	var progressMu sync.Mutex
-
-	// getOrCreateTracker gets or creates a tool status tracker for a chat
-	getOrCreateTracker := func(chatID int64) *telegram.ToolStatusTracker {
-		trackersMu.Lock()
-		defer trackersMu.Unlock()
-
-		if tracker, ok := toolTrackers[chatID]; ok {
-			return tracker
-		}
-
-		tracker := telegram.NewToolStatusTracker(bot, chatID)
-		tracker.Start()
-		toolTrackers[chatID] = tracker
-		return tracker
-	}
-
-	// clearTracker flushes and clears a tracker for a chat
-	clearTracker := func(chatID int64) {
-		trackersMu.Lock()
-		tracker := toolTrackers[chatID]
-		trackersMu.Unlock()
-
-		if tracker != nil {
-			tracker.Flush() // Force final render before clearing
-			tracker.Clear()
-		}
-	}
-
-	// getOrCreateProgressTracker gets or creates a progress tracker for a chat
-	getOrCreateProgressTracker := func(chatID int64) *telegram.ProgressTracker {
-		progressMu.Lock()
-		defer progressMu.Unlock()
-
-		if tracker, ok := progressTrackers[chatID]; ok {
-			return tracker
-		}
-
-		tracker := telegram.NewProgressTracker(bot, chatID)
-		progressTrackers[chatID] = tracker
-		return tracker
-	}
-
-	// clearProgressTracker clears the progress tracker for a chat
-	clearProgressTracker := func(chatID int64) {
-		progressMu.Lock()
-		tracker := progressTrackers[chatID]
-		progressMu.Unlock()
-
-		if tracker != nil {
-			tracker.Clear()
-		}
-	}
+	// Unified tracker manager for all chat-scoped state
+	trackerMgr := trackers.NewManager(bot)
 
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -202,116 +140,20 @@ func main() {
 		stopTyping := bot.TypingLoop(chatID)
 		defer stopTyping()
 
-		// Handle /clear specially - kill the process instead of forwarding to Claude
-		// (Claude's /clear is a CLI command, not a user message)
-		cmd := strings.SplitN(text, " ", 2)[0]
-		cmd = strings.ReplaceAll(cmd, "_", "-")
-		if cmd == "/clear" {
-			slog.Info("clearing conversation", "chat_id", chatID)
-			manager.Reset(chatID)
-			respond("Conversation cleared.", false) // Play sound for clear confirmation
-			return
-		}
-
-		// Handle /rebuild - recompile and restart ARIA
-		if cmd == "/rebuild" {
-			slog.Info("rebuild requested", "chat_id", chatID)
-			respond("Rebuilding ARIA...", true)
-
-			// Run go build in background, then exec the new binary
-			go func() {
-				if err := rebuildAndRestart(manager); err != nil {
-					slog.Error("rebuild failed", "error", err)
-					bot.SendMessage(chatID, fmt.Sprintf("Rebuild failed: %v", err), false)
+		// Check if this is a routed command (clear, rebuild, cd, sessions)
+		if cmdName, cmdArgs := commands.ParseCommand(text); cmdName != "" {
+			if cmd := cmdRouter.Lookup(cmdName); cmd != nil {
+				resp, err := cmd.Execute(msgCtx, chatID, cmdArgs)
+				if err != nil {
+					slog.Error("command error", "cmd", cmdName, "error", err)
+					respond(fmt.Sprintf("Error: %v", err), false)
+					return
 				}
-				// If we get here, exec failed or wasn't called
-			}()
-			return
-		}
-
-		// Handle /cd - change working directory
-		if cmd == "/cd" {
-			parts := strings.SplitN(text, " ", 2)
-			if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-				// No path provided - show current cwd
-				currentCwd := manager.GetCwd(chatID)
-				if currentCwd == "" {
-					currentCwd = "(default)"
-				}
-				respond(fmt.Sprintf("Working directory: %s", currentCwd), true)
-				return
-			}
-
-			// Expand ~ to home directory
-			newCwd := strings.TrimSpace(parts[1])
-			if strings.HasPrefix(newCwd, "~") {
-				newCwd = strings.Replace(newCwd, "~", homeDir, 1)
-			}
-
-			// Resolve to absolute path
-			newCwd, err := filepath.Abs(newCwd)
-			if err != nil {
-				respond(fmt.Sprintf("Invalid path: %v", err), false)
-				return
-			}
-
-			// Validate path exists and is a directory
-			info, err := os.Stat(newCwd)
-			if err != nil {
-				if os.IsNotExist(err) {
-					respond(fmt.Sprintf("Directory not found: %s", newCwd), false)
-				} else {
-					respond(fmt.Sprintf("Error checking path: %v", err), false)
+				if resp != nil {
+					respond(resp.Text, resp.Silent)
 				}
 				return
 			}
-			if !info.IsDir() {
-				respond(fmt.Sprintf("Not a directory: %s", newCwd), false)
-				return
-			}
-
-			// Change the cwd (kills process, preserves session)
-			slog.Info("changing cwd", "chat_id", chatID, "cwd", newCwd)
-			manager.SetCwd(chatID, newCwd)
-
-			// Format display path (collapse home dir back to ~)
-			displayPath := newCwd
-			if strings.HasPrefix(newCwd, homeDir) {
-				displayPath = "~" + strings.TrimPrefix(newCwd, homeDir)
-			}
-			respond(fmt.Sprintf("Now working in %s", displayPath), false)
-			return
-		}
-
-		// Handle /sessions - show session picker keyboard
-		if cmd == "/sessions" {
-			slog.Info("showing sessions", "chat_id", chatID)
-			sessions, err := sessionDiscovery.DiscoverSessions(7)
-			if err != nil {
-				slog.Error("failed to discover sessions", "error", err)
-				respond("Failed to load sessions.", false)
-				return
-			}
-			if len(sessions) == 0 {
-				respond("No recent sessions found.", false)
-				return
-			}
-			// Convert to display info
-			var displaySessions []telegram.SessionDisplayInfo
-			for _, s := range sessions {
-				displaySessions = append(displaySessions, telegram.SessionDisplayInfo{
-					ID:          s.ID,
-					ShortID:     s.ShortID,
-					ProjectName: s.ProjectName,
-					Summary:     s.Summary,
-					TimeAgo:     claude.FormatTimeAgo(s.LastActive),
-				})
-			}
-			keyboard := telegram.BuildSessionKeyboard(displaySessions)
-			if err := bot.SendQuestionKeyboard(chatID, "*Sessions*", keyboard); err != nil {
-				slog.Error("failed to send session keyboard", "error", err)
-			}
-			return
 		}
 
 		// Check if this is a silent command that needs special handling
@@ -323,121 +165,23 @@ func main() {
 		// Track if we got any response
 		gotResponse := false
 
-		// Get progress tracker for this chat
-		progressTracker := getOrCreateProgressTracker(chatID)
+		// Build response callbacks using shared handler
+		cb := &handlers.CallbackBuilder{
+			ChatID:     chatID,
+			TrackerMgr: trackerMgr,
+			Bot:        bot,
+			SendFn: func(text string, silent bool) {
+				gotResponse = true
+				respond(text, silent)
+			},
+			Logger: slog.Default(),
+		}
 
 		// Send message via persistent process manager
-		// isFinal=true means it's the last message, so we play a sound
-		// isFinal=false means intermediate message, send silently
-		err := manager.Send(msgCtx, chatID, text, claude.ResponseCallbacks{
-			OnMessage: func(responseText string, isFinal bool) {
-				gotResponse = true
-				silent := !isFinal // Silent for intermediate messages, sound for final
-
-				// Flush and clear tracker before sending text to start new tool group
-				tracker := getOrCreateTracker(chatID)
-				tracker.FlushAndClear()
-
-				slog.Debug("sending response to telegram",
-					"chat_id", chatID,
-					"text_length", len(responseText),
-					"is_final", isFinal,
-					"silent", silent,
-				)
-				respond(responseText, silent)
-				slog.Debug("response sent")
-			},
-			OnTodoUpdate: func(todos []claude.Todo) {
-				// Convert claude.Todo to telegram.Todo
-				telegramTodos := make([]telegram.Todo, len(todos))
-				for i, t := range todos {
-					telegramTodos[i] = telegram.Todo{
-						Content:    t.Content,
-						Status:     t.Status,
-						ActiveForm: t.ActiveForm,
-					}
-				}
-				progressTracker.Update(telegramTodos)
-				slog.Debug("todo update",
-					"chat_id", chatID,
-					"count", len(todos),
-				)
-			},
-			OnToolUse: func(tool claude.ToolUse) {
-				// Handle AskUserQuestion specially - send inline keyboard (no notification)
-				if tool.Name == "AskUserQuestion" {
-					parsed, err := telegram.ParseAskUserQuestion(tool.Input)
-					if err != nil {
-						slog.Error("failed to parse AskUserQuestion", "error", err)
-						return
-					}
-
-					// Store pending question for this chat
-					pendingMu.Lock()
-					pendingQuestions[chatID] = &PendingQuestion{
-						ToolID:     tool.ID,
-						Questions:  parsed.Questions,
-						CurrentIdx: 0,
-						Answers:    make([]string, 0, len(parsed.Questions)),
-					}
-					pendingMu.Unlock()
-
-					// Send keyboard for first question
-					if len(parsed.Questions) > 0 {
-						q := parsed.Questions[0]
-						keyboard, text := telegram.BuildQuestionKeyboard(tool.ID, 0, q)
-						if err := bot.SendQuestionKeyboard(chatID, text, keyboard); err != nil {
-							slog.Error("failed to send question keyboard",
-								"chat_id", chatID,
-								"error", err,
-							)
-						}
-					}
-
-					slog.Debug("sent AskUserQuestion keyboard",
-						"chat_id", chatID,
-						"tool_id", tool.ID,
-						"question_count", len(parsed.Questions),
-					)
-					return
-				}
-
-				// Add tool to consolidated tracker
-				tracker := getOrCreateTracker(chatID)
-				tracker.AddTool(telegram.ToolUse{
-					ID:    tool.ID,
-					Name:  tool.Name,
-					Input: tool.Input,
-				})
-				slog.Debug("tool added to tracker",
-					"chat_id", chatID,
-					"tool", tool.Name,
-				)
-			},
-			OnToolResult: func(result claude.ToolResult) {
-				tracker := getOrCreateTracker(chatID)
-				tracker.CompleteTool(result.ToolID, result.IsError)
-			},
-			OnToolError: func(toolID string, errorMsg string) {
-				// Just log - the ✗ in tool tracker is enough visual indication
-				slog.Debug("tool error",
-					"chat_id", chatID,
-					"tool_id", toolID,
-					"error", errorMsg,
-				)
-			},
-			OnPermissionDenial: func(denials []string) {
-				// Just log for now - Phase 10 will add interactive permission handling
-				slog.Warn("permission denials",
-					"chat_id", chatID,
-					"denials", denials,
-				)
-			},
-		})
+		err := manager.Send(msgCtx, chatID, text, cb.Build())
 
 		// Clear the trackers after response is complete
-		clearTracker(chatID)
-		clearProgressTracker(chatID)
+		cb.ClearTrackers()
 
 		if err != nil {
 			slog.Error("claude error",
@@ -513,10 +257,7 @@ func main() {
 		}
 
 		// Get the pending question for this chat
-		pendingMu.RLock()
-		pending := pendingQuestions[chatID]
-		pendingMu.RUnlock()
-
+		pending := trackerMgr.GetQuestion(chatID)
 		if pending == nil {
 			slog.Warn("no pending question for chat", "chat_id", chatID)
 			return "Question expired"
@@ -529,9 +270,7 @@ func main() {
 				"question_idx", cb.QuestionIdx,
 			)
 			// Clear pending question - they'll type a custom response
-			pendingMu.Lock()
-			delete(pendingQuestions, chatID)
-			pendingMu.Unlock()
+			trackerMgr.ClearQuestion(chatID)
 			return "Type your answer and send it"
 		}
 
@@ -553,14 +292,12 @@ func main() {
 		)
 
 		// Store this answer
-		pendingMu.Lock()
 		pending.Answers = append(pending.Answers, selectedOption.Label)
 		pending.CurrentIdx++
 		nextIdx := pending.CurrentIdx
 		totalQuestions := len(pending.Questions)
 		allAnswers := make([]string, len(pending.Answers))
 		copy(allAnswers, pending.Answers)
-		pendingMu.Unlock()
 
 		// Check if more questions remain
 		if nextIdx < totalQuestions {
@@ -574,9 +311,7 @@ func main() {
 		}
 
 		// All questions answered - clear pending and send all answers to Claude
-		pendingMu.Lock()
-		delete(pendingQuestions, chatID)
-		pendingMu.Unlock()
+		trackerMgr.ClearQuestion(chatID)
 
 		// Format answers as a combined response
 		combinedAnswer := ""
@@ -593,87 +328,20 @@ func main() {
 			stopTyping := bot.TypingLoop(chatID)
 			defer stopTyping()
 
-			// Get progress tracker for this chat
-			progressTracker := getOrCreateProgressTracker(chatID)
-
-			err := manager.Send(cbCtx, chatID, combinedAnswer, claude.ResponseCallbacks{
-				OnMessage: func(text string, isFinal bool) {
-					silent := !isFinal
-
-					// Flush and clear tracker before sending text to start new tool group
-					tracker := getOrCreateTracker(chatID)
-					tracker.FlushAndClear()
-
+			// Build response callbacks using shared handler
+			cb := &handlers.CallbackBuilder{
+				ChatID:     chatID,
+				TrackerMgr: trackerMgr,
+				Bot:        bot,
+				SendFn: func(text string, silent bool) {
 					bot.SendMessage(chatID, text, silent)
 				},
-				OnTodoUpdate: func(todos []claude.Todo) {
-					// Convert claude.Todo to telegram.Todo
-					telegramTodos := make([]telegram.Todo, len(todos))
-					for i, t := range todos {
-						telegramTodos[i] = telegram.Todo{
-							Content:    t.Content,
-							Status:     t.Status,
-							ActiveForm: t.ActiveForm,
-						}
-					}
-					progressTracker.Update(telegramTodos)
-				},
-				OnToolUse: func(tool claude.ToolUse) {
-					// Handle nested AskUserQuestion or other tools
-					if tool.Name == "AskUserQuestion" {
-						parsed, err := telegram.ParseAskUserQuestion(tool.Input)
-						if err != nil {
-							slog.Error("failed to parse AskUserQuestion in callback", "error", err)
-							return
-						}
-						pendingMu.Lock()
-						pendingQuestions[chatID] = &PendingQuestion{
-							ToolID:     tool.ID,
-							Questions:  parsed.Questions,
-							CurrentIdx: 0,
-							Answers:    make([]string, 0, len(parsed.Questions)),
-						}
-						pendingMu.Unlock()
-						// Send first question
-						if len(parsed.Questions) > 0 {
-							q := parsed.Questions[0]
-							keyboard, text := telegram.BuildQuestionKeyboard(tool.ID, 0, q)
-							bot.SendQuestionKeyboard(chatID, text, keyboard)
-						}
-						return
-					}
+				Logger: slog.Default(),
+			}
 
-					// Add tool to consolidated tracker
-					tracker := getOrCreateTracker(chatID)
-					tracker.AddTool(telegram.ToolUse{
-						ID:    tool.ID,
-						Name:  tool.Name,
-						Input: tool.Input,
-					})
-				},
-				OnToolResult: func(result claude.ToolResult) {
-					tracker := getOrCreateTracker(chatID)
-					tracker.CompleteTool(result.ToolID, result.IsError)
-				},
-				OnToolError: func(toolID string, errorMsg string) {
-					// Just log - the ✗ in tool tracker is enough visual indication
-					slog.Debug("tool error in callback",
-						"chat_id", chatID,
-						"tool_id", toolID,
-						"error", errorMsg,
-					)
-				},
-				OnPermissionDenial: func(denials []string) {
-					// Just log for now - Phase 10 will add interactive permission handling
-					slog.Warn("permission denials in callback",
-						"chat_id", chatID,
-						"denials", denials,
-					)
-				},
-			})
-			// Clear the trackers after response
-			clearTracker(chatID)
-			clearProgressTracker(chatID)
+			err := manager.Send(cbCtx, chatID, combinedAnswer, cb.Build())
+			cb.ClearTrackers()
+
 			if err != nil {
 				slog.Error("error sending callback response to claude", "error", err)
 				bot.SendMessage(chatID, "Sorry, something went wrong.", false)
@@ -737,81 +405,3 @@ func setupLogger(cfg *config.Config) {
 	slog.SetDefault(slog.New(handler))
 }
 
-// rebuildAndRestart compiles the current source and exec's the new binary
-func rebuildAndRestart(manager *claude.ProcessManager) error {
-	slog.Info("starting rebuild",
-		"source_dir", sourceDir,
-		"executable", executablePath,
-	)
-
-	// Check that source directory has go.mod
-	goModPath := filepath.Join(sourceDir, "go.mod")
-	if _, err := os.Stat(goModPath); os.IsNotExist(err) {
-		return fmt.Errorf("no go.mod found in %s - set --source flag to aria source directory", sourceDir)
-	}
-
-	// Build the new binary to a temp location first
-	tempBinary := executablePath + ".new"
-	buildCmd := exec.Command("go", "build", "-o", tempBinary, "./cmd/aria")
-	buildCmd.Dir = sourceDir
-	buildCmd.Stdout = os.Stdout
-	buildCmd.Stderr = os.Stderr
-
-	slog.Info("running go build", "dir", sourceDir, "output", tempBinary)
-	if err := buildCmd.Run(); err != nil {
-		return fmt.Errorf("go build failed: %w", err)
-	}
-
-	// Replace the old binary with the new one
-	if err := os.Rename(tempBinary, executablePath); err != nil {
-		// Try copy if rename fails (cross-device)
-		if copyErr := copyFile(tempBinary, executablePath); copyErr != nil {
-			os.Remove(tempBinary)
-			return fmt.Errorf("failed to replace binary: %w", err)
-		}
-		os.Remove(tempBinary)
-	}
-
-	slog.Info("build successful, restarting...")
-
-	// Gracefully shutdown Claude processes
-	manager.Shutdown()
-
-	// Get current args to pass to new process
-	args := os.Args
-
-	// Exec the new binary - this replaces the current process
-	slog.Info("exec'ing new binary", "path", executablePath, "args", args)
-	if err := syscall.Exec(executablePath, args, os.Environ()); err != nil {
-		return fmt.Errorf("exec failed: %w", err)
-	}
-
-	// This line is never reached if exec succeeds
-	return nil
-}
-
-// copyFile copies a file from src to dst
-func copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer sourceFile.Close()
-
-	destFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer destFile.Close()
-
-	if _, err := io.Copy(destFile, sourceFile); err != nil {
-		return err
-	}
-
-	// Copy permissions
-	info, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-	return os.Chmod(dst, info.Mode())
-}

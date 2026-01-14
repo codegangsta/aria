@@ -4,6 +4,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/codegangsta/aria/internal/types"
 )
 
 // ToolStatus represents the status of a tracked tool
@@ -18,7 +20,7 @@ const (
 // TrackedTool represents a tool being tracked in the consolidated view
 type TrackedTool struct {
 	ID     string
-	Tool   ToolUse
+	Tool   types.ToolUse
 	Status ToolStatus
 }
 
@@ -74,7 +76,7 @@ func (t *ToolStatusTracker) Stop() {
 }
 
 // AddTool adds a new tool to the tracker as pending
-func (t *ToolStatusTracker) AddTool(tool ToolUse) {
+func (t *ToolStatusTracker) AddTool(tool types.ToolUse) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 

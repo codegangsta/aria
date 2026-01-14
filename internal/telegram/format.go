@@ -4,14 +4,9 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-)
 
-// ToolUse represents a tool call from Claude for display purposes
-type ToolUse struct {
-	ID    string
-	Name  string
-	Input map[string]interface{}
-}
+	"github.com/codegangsta/aria/internal/types"
+)
 
 // toolDisplayConfig defines how to display a specific tool
 type toolDisplayConfig struct {
@@ -170,7 +165,7 @@ var mcpToolDisplays = map[string]toolDisplayConfig{
 }
 
 // formatToolText creates the text content of a tool notification (no emoji, no italic wrapper)
-func formatToolText(tool ToolUse) string {
+func formatToolText(tool types.ToolUse) string {
 	// Check for exact tool match first
 	if cfg, ok := toolDisplays[tool.Name]; ok {
 		detail := ""
@@ -206,19 +201,19 @@ func formatToolText(tool ToolUse) string {
 
 // FormatToolNotification creates a Telegram-friendly display of a tool call in progress
 // Returns italic text with ◌ prefix for subtle, compact appearance
-func FormatToolNotification(tool ToolUse) string {
+func FormatToolNotification(tool types.ToolUse) string {
 	content := formatToolText(tool)
 	return "_◌ " + content + "_"
 }
 
 // FormatToolNotificationSuccess creates a completed tool notification with ✓
-func FormatToolNotificationSuccess(tool ToolUse) string {
+func FormatToolNotificationSuccess(tool types.ToolUse) string {
 	content := formatToolText(tool)
 	return "_✓ " + content + "_"
 }
 
 // FormatToolNotificationFailure creates a failed tool notification with ✗
-func FormatToolNotificationFailure(tool ToolUse) string {
+func FormatToolNotificationFailure(tool types.ToolUse) string {
 	content := formatToolText(tool)
 	return "_✗ " + content + "_"
 }
