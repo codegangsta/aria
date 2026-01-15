@@ -58,7 +58,7 @@ func (c *SessionsCommand) Execute(ctx context.Context, chatID int64, args string
 	}
 
 	keyboard := telegram.BuildSessionKeyboard(displaySessions)
-	if err := c.bot.SendQuestionKeyboard(chatID, "*Sessions*", keyboard); err != nil {
+	if _, err := c.bot.SendQuestionKeyboard(chatID, "*Sessions*", keyboard); err != nil {
 		slog.Error("failed to send session keyboard", "error", err)
 	}
 

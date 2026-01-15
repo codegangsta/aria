@@ -13,13 +13,31 @@ type PendingQuestion struct {
 	Questions  []telegram.Question
 	CurrentIdx int      // Which question we're on (0-indexed)
 	Answers    []string // Collected answers so far
+	MessageID  int64    // Telegram message ID for the keyboard (for deletion)
+}
+
+// PendingPermission stores context for a permission request waiting for user input
+type PendingPermission struct {
+	ToolID    string                         // Tool ID for the permission prompt tool call
+	ToolName  string                         // Name of the tool requesting permission
+	Input     map[string]interface{}         // Input for the tool
+	MessageID int64                          // Telegram message ID for the keyboard
+	Response  chan *PermissionResult         // Channel to send the result back
+}
+
+// PermissionResult is the result of a permission prompt
+type PermissionResult struct {
+	Behavior     string                 // "allow", "deny", "allow-always"
+	UpdatedInput map[string]interface{} // For allow responses
+	Message      string                 // For deny responses
 }
 
 // ChatTrackers holds all trackers for a single chat
 type ChatTrackers struct {
-	Tool     *telegram.ToolStatusTracker
-	Progress *telegram.ProgressTracker
-	Question *PendingQuestion
+	Tool       *telegram.ToolStatusTracker
+	Progress   *telegram.ProgressTracker
+	Question   *PendingQuestion
+	Permission *PendingPermission
 }
 
 // Manager manages all tracker types for all chats
@@ -130,4 +148,35 @@ func (m *Manager) ClearAll(chatID int64) {
 	m.ClearToolTracker(chatID)
 	m.ClearProgressTracker(chatID)
 	m.ClearQuestion(chatID)
+	m.ClearPermission(chatID)
+}
+
+// GetPermission gets the pending permission for a chat (nil if none)
+func (m *Manager) GetPermission(chatID int64) *PendingPermission {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if ct, ok := m.chats[chatID]; ok {
+		return ct.Permission
+	}
+	return nil
+}
+
+// SetPermission sets the pending permission for a chat
+func (m *Manager) SetPermission(chatID int64, p *PendingPermission) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ct := m.getOrCreate(chatID)
+	ct.Permission = p
+}
+
+// ClearPermission clears the pending permission for a chat
+func (m *Manager) ClearPermission(chatID int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if ct, ok := m.chats[chatID]; ok {
+		ct.Permission = nil
+	}
 }

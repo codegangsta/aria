@@ -51,10 +51,36 @@ type InitEvent struct {
 	SlashCommands []string `json:"slash_commands"`
 }
 
+// ProcessOptions contains options for creating a Claude process
+type ProcessOptions struct {
+	ClaudePath         string
+	ChatID             int64
+	Debug              bool
+	SkipPermissions    bool
+	ResumeSessionID    string
+	Cwd                string
+	MCPConfigPath      string // Path to MCP config file for permission prompts
+	PermissionToolName string // Name of the permission prompt tool (e.g., "mcp__aria__prompt_permission")
+	Logger             *slog.Logger
+}
+
 // NewProcess creates and starts a new persistent Claude process
 // If resumeSessionID is provided, the process will resume that session
 // If cwd is provided, the process will start in that directory
 func NewProcess(claudePath string, chatID int64, debug bool, skipPermissions bool, resumeSessionID string, cwd string, logger *slog.Logger) (*ClaudeProcess, error) {
+	return NewProcessWithOptions(ProcessOptions{
+		ClaudePath:      claudePath,
+		ChatID:          chatID,
+		Debug:           debug,
+		SkipPermissions: skipPermissions,
+		ResumeSessionID: resumeSessionID,
+		Cwd:             cwd,
+		Logger:          logger,
+	})
+}
+
+// NewProcessWithOptions creates and starts a new persistent Claude process with full options
+func NewProcessWithOptions(opts ProcessOptions) (*ClaudeProcess, error) {
 	args := []string{
 		"-p",
 		"--verbose",
@@ -62,19 +88,23 @@ func NewProcess(claudePath string, chatID int64, debug bool, skipPermissions boo
 		"--output-format", "stream-json",
 	}
 
-	if skipPermissions {
+	if opts.SkipPermissions {
 		args = append(args, "--dangerously-skip-permissions")
+	} else if opts.MCPConfigPath != "" && opts.PermissionToolName != "" {
+		// Use MCP-based permission prompts
+		args = append(args, "--mcp-config", opts.MCPConfigPath)
+		args = append(args, "--permission-prompt-tool", opts.PermissionToolName)
 	}
 
-	if resumeSessionID != "" {
-		args = append(args, "--resume", resumeSessionID)
+	if opts.ResumeSessionID != "" {
+		args = append(args, "--resume", opts.ResumeSessionID)
 	}
 
-	cmd := exec.Command(claudePath, args...)
+	cmd := exec.Command(opts.ClaudePath, args...)
 
 	// Set working directory if specified
-	if cwd != "" {
-		cmd.Dir = cwd
+	if opts.Cwd != "" {
+		cmd.Dir = opts.Cwd
 	}
 
 	stdin, err := cmd.StdinPipe()
@@ -114,9 +144,9 @@ func NewProcess(claudePath string, chatID int64, debug bool, skipPermissions boo
 		stdin:   stdin,
 		stdout:  stdout,
 		scanner: scanner,
-		chatID:  chatID,
-		debug:   debug,
-		logger:  logger,
+		chatID:  opts.ChatID,
+		debug:   opts.Debug,
+		logger:  opts.Logger,
 		done:    done,
 	}
 
@@ -129,12 +159,12 @@ func NewProcess(claudePath string, chatID int64, debug bool, skipPermissions boo
 				proc.mu.Lock()
 				proc.sessionNotFound = true
 				proc.mu.Unlock()
-				logger.Warn("session not found, will use new session",
-					"chat_id", chatID,
+				opts.Logger.Warn("session not found, will use new session",
+					"chat_id", opts.ChatID,
 					"stderr", line,
 				)
 			} else if line != "" {
-				logger.Debug("claude stderr", "chat_id", chatID, "line", line)
+				opts.Logger.Debug("claude stderr", "chat_id", opts.ChatID, "line", line)
 			}
 		}
 	}()

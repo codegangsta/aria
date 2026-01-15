@@ -388,18 +388,43 @@ func (b *Bot) SendAndPinMessage(chatID int64, text string) (int64, error) {
 }
 
 // SendQuestionKeyboard sends a question with inline keyboard options
-func (b *Bot) SendQuestionKeyboard(chatID int64, text string, keyboard gotgbot.InlineKeyboardMarkup) error {
+func (b *Bot) SendQuestionKeyboard(chatID int64, text string, keyboard gotgbot.InlineKeyboardMarkup) (int64, error) {
 	opts := &gotgbot.SendMessageOpts{
 		ParseMode:   "MarkdownV2",
 		ReplyMarkup: keyboard,
 	}
-	_, err := b.bot.SendMessage(chatID, text, opts)
+	msg, err := b.bot.SendMessage(chatID, text, opts)
 	if err != nil {
 		b.logger.Error("failed to send question keyboard",
 			"chat_id", chatID,
 			"error", err,
 		)
+		return 0, err
 	}
+	return msg.MessageId, nil
+}
+
+// SendPermissionKeyboard sends a permission request with inline keyboard
+// Returns the message ID for later editing/deletion
+func (b *Bot) SendPermissionKeyboard(chatID int64, text string, keyboard gotgbot.InlineKeyboardMarkup) (int64, error) {
+	opts := &gotgbot.SendMessageOpts{
+		ParseMode:   "MarkdownV2",
+		ReplyMarkup: keyboard,
+	}
+	msg, err := b.bot.SendMessage(chatID, text, opts)
+	if err != nil {
+		b.logger.Error("failed to send permission keyboard",
+			"chat_id", chatID,
+			"error", err,
+		)
+		return 0, err
+	}
+	return msg.MessageId, nil
+}
+
+// DeleteMessage deletes a message by ID
+func (b *Bot) DeleteMessage(chatID int64, msgID int64) error {
+	_, err := b.bot.DeleteMessage(chatID, msgID, nil)
 	return err
 }
 

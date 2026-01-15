@@ -135,6 +135,89 @@ func ParseCallbackData(data string) (*CallbackData, error) {
 	return &cb, nil
 }
 
+// PermissionRequest represents a pending permission request
+type PermissionRequest struct {
+	ToolName string                 `json:"tool_name"`
+	Input    map[string]interface{} `json:"input"`
+}
+
+// BuildPermissionKeyboard creates an inline keyboard for permission prompts
+// Returns the keyboard and a formatted message describing the permission request
+func BuildPermissionKeyboard(toolID string, toolName string, input map[string]interface{}) (gotgbot.InlineKeyboardMarkup, string) {
+	// Format the permission request message
+	var details string
+	switch toolName {
+	case "Write", "Edit":
+		if path, ok := input["file_path"].(string); ok {
+			details = fmt.Sprintf("File: %s", path)
+		}
+	case "Bash":
+		if cmd, ok := input["command"].(string); ok {
+			// Truncate long commands
+			if len(cmd) > 100 {
+				cmd = cmd[:97] + "..."
+			}
+			details = fmt.Sprintf("Command: %s", cmd)
+		}
+	default:
+		// Generic: show first few input keys
+		keys := make([]string, 0)
+		for k := range input {
+			keys = append(keys, k)
+			if len(keys) >= 3 {
+				break
+			}
+		}
+		if len(keys) > 0 {
+			details = fmt.Sprintf("Params: %v", keys)
+		}
+	}
+
+	text := fmt.Sprintf("*Permission Request*\nTool: %s", escapeMarkdownV2(toolName))
+	if details != "" {
+		text += fmt.Sprintf("\n%s", escapeMarkdownV2(details))
+	}
+
+	// Create buttons: Allow, Allow Always, Deny
+	allowData := CallbackData{
+		Type:   "p",
+		ToolID: toolID,
+		Action: "a", // allow
+	}
+	allowAlwaysData := CallbackData{
+		Type:   "p",
+		ToolID: toolID,
+		Action: "aa", // allow-always
+	}
+	denyData := CallbackData{
+		Type:   "p",
+		ToolID: toolID,
+		Action: "d", // deny
+	}
+
+	// Truncate tool ID if needed for 64 byte limit
+	truncateCallback := func(cb *CallbackData) string {
+		data, _ := json.Marshal(cb)
+		if len(data) > 64 && len(cb.ToolID) > 8 {
+			cb.ToolID = cb.ToolID[:8]
+			data, _ = json.Marshal(cb)
+		}
+		return string(data)
+	}
+
+	keyboard := gotgbot.InlineKeyboardMarkup{
+		InlineKeyboard: [][]gotgbot.InlineKeyboardButton{
+			{
+				{Text: "Allow", CallbackData: truncateCallback(&allowData)},
+				{Text: "Always", CallbackData: truncateCallback(&allowAlwaysData)},
+				{Text: "Deny", CallbackData: truncateCallback(&denyData)},
+			},
+		},
+	}
+
+	return keyboard, text
+}
+
 // BuildSessionKeyboard creates an inline keyboard for session selection
 func BuildSessionKeyboard(sessions []SessionDisplayInfo) gotgbot.InlineKeyboardMarkup {
 	var rows [][]gotgbot.InlineKeyboardButton

@@ -96,24 +96,27 @@ func (b *CallbackBuilder) handleAskUserQuestion(tool types.ToolUse, logger *slog
 		return
 	}
 
-	// Store pending question for this chat
-	b.TrackerMgr.SetQuestion(b.ChatID, &trackers.PendingQuestion{
-		ToolID:     tool.ID,
-		Questions:  parsed.Questions,
-		CurrentIdx: 0,
-		Answers:    make([]string, 0, len(parsed.Questions)),
-	})
-
-	// Send keyboard for first question
+	// Send keyboard for first question and store pending question
 	if len(parsed.Questions) > 0 {
 		q := parsed.Questions[0]
 		keyboard, text := telegram.BuildQuestionKeyboard(tool.ID, 0, q)
-		if err := b.Bot.SendQuestionKeyboard(b.ChatID, text, keyboard); err != nil {
+		msgID, err := b.Bot.SendQuestionKeyboard(b.ChatID, text, keyboard)
+		if err != nil {
 			logger.Error("failed to send question keyboard",
 				"chat_id", b.ChatID,
 				"error", err,
 			)
+			return
 		}
+
+		// Store pending question with message ID for later deletion
+		b.TrackerMgr.SetQuestion(b.ChatID, &trackers.PendingQuestion{
+			ToolID:     tool.ID,
+			Questions:  parsed.Questions,
+			CurrentIdx: 0,
+			Answers:    make([]string, 0, len(parsed.Questions)),
+			MessageID:  msgID,
+		})
 	}
 
 	logger.Debug("sent AskUserQuestion keyboard",

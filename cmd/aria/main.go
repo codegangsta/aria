@@ -16,6 +16,7 @@ import (
 	"github.com/codegangsta/aria/internal/commands"
 	"github.com/codegangsta/aria/internal/config"
 	"github.com/codegangsta/aria/internal/handlers"
+	"github.com/codegangsta/aria/internal/mcp"
 	"github.com/codegangsta/aria/internal/telegram"
 	"github.com/codegangsta/aria/internal/trackers"
 )
@@ -30,7 +31,14 @@ func main() {
 	configPath := flag.String("config", "", "path to config file")
 	claudePath := flag.String("claude", "claude", "path to claude binary")
 	sourceDirFlag := flag.String("source", "", "path to source directory (for /rebuild)")
+	mcpServer := flag.Bool("mcp-server", false, "run as MCP server (for Claude permission prompts)")
 	flag.Parse()
+
+	// If running as MCP server, handle that and exit
+	if *mcpServer {
+		runMCPServer()
+		return
+	}
 
 	// Get the path to the current executable
 	var err error
@@ -87,6 +95,32 @@ func main() {
 	manager := claude.NewManager(*claudePath, cfg.Debug, cfg.Claude.SkipPermissions, slog.Default())
 	sessionDiscovery := claude.NewSessionDiscovery(homeDir+"/.claude", slog.Default())
 
+	// Set up MCP callback server and bridge for permission prompts (if not skipping permissions)
+	var mcpBridge *mcp.BridgeManager
+	var callbackServer *mcp.CallbackServer
+	if !cfg.Claude.SkipPermissions {
+		// Start callback server first to get the port
+		var err error
+		callbackServer, err = mcp.NewCallbackServer(slog.Default())
+		if err != nil {
+			slog.Error("failed to create callback server", "error", err)
+			os.Exit(1)
+		}
+		callbackServer.Start()
+		defer callbackServer.Stop()
+
+		// Create bridge manager with callback port
+		mcpBridge, err = mcp.NewBridgeManager(executablePath, callbackServer.Port(), slog.Default())
+		if err != nil {
+			slog.Error("failed to create MCP bridge manager", "error", err)
+			os.Exit(1)
+		}
+		defer mcpBridge.Cleanup()
+
+		// We'll set the handler after trackerMgr is created (below)
+		slog.Info("MCP permission prompts enabled", "callback_port", callbackServer.Port())
+	}
+
 	// Set up session persistence
 	sessionsPath := homeDir + "/.config/aria/sessions.yaml"
 	persistence := claude.NewSessionPersistence(sessionsPath)
@@ -112,6 +146,70 @@ func main() {
 
 	// Unified tracker manager for all chat-scoped state
 	trackerMgr := trackers.NewManager(bot)
+
+	// Set up MCP callback handler now that we have trackerMgr and bot
+	if callbackServer != nil && mcpBridge != nil {
+		callbackServer.SetHandler(func(ctx context.Context, req mcp.PermissionRequest) (*mcp.PermissionResponse, error) {
+			chatID := req.ChatID
+			slog.Info("permission callback received",
+				"chat_id", chatID,
+				"tool", req.ToolName,
+			)
+
+			// Create response channel
+			respChan := make(chan *trackers.PermissionResult, 1)
+
+			// Build and send permission keyboard
+			keyboard, text := telegram.BuildPermissionKeyboard("perm", req.ToolName, req.Input)
+			msgID, err := bot.SendPermissionKeyboard(chatID, text, keyboard)
+			if err != nil {
+				return &mcp.PermissionResponse{
+					Behavior: "deny",
+					Message:  fmt.Sprintf("Failed to send keyboard: %v", err),
+				}, nil
+			}
+
+			// Store pending permission
+			trackerMgr.SetPermission(chatID, &trackers.PendingPermission{
+				ToolID:    "perm",
+				ToolName:  req.ToolName,
+				Input:     req.Input,
+				MessageID: msgID,
+				Response:  respChan,
+			})
+
+			// Wait for user response (with timeout)
+			select {
+			case result := <-respChan:
+				return &mcp.PermissionResponse{
+					Behavior:     result.Behavior,
+					UpdatedInput: result.UpdatedInput,
+					Message:      result.Message,
+				}, nil
+			case <-ctx.Done():
+				trackerMgr.ClearPermission(chatID)
+				bot.DeleteMessage(chatID, msgID)
+				return &mcp.PermissionResponse{
+					Behavior: "deny",
+					Message:  "Request cancelled",
+				}, nil
+			case <-time.After(2 * time.Minute):
+				trackerMgr.ClearPermission(chatID)
+				bot.DeleteMessage(chatID, msgID)
+				return &mcp.PermissionResponse{
+					Behavior: "deny",
+					Message:  "Permission request timed out",
+				}, nil
+			}
+		})
+
+		// Set up MCP config with per-chat config function
+		manager.SetMCPConfig(&claude.MCPConfig{
+			ToolName:   mcpBridge.GetToolName(),
+			ConfigFunc: mcpBridge.GetConfigPath,
+		})
+		slog.Info("MCP permission callback handler configured")
+	}
 
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -212,6 +310,53 @@ func main() {
 			return "Error processing selection"
 		}
 
+		// Handle permission callbacks
+		if cb.Type == "p" {
+			pending := trackerMgr.GetPermission(chatID)
+			if pending == nil {
+				slog.Warn("no pending permission for chat", "chat_id", chatID)
+				return "Permission request expired"
+			}
+
+			var result *trackers.PermissionResult
+			switch cb.Action {
+			case "a": // allow
+				result = &trackers.PermissionResult{
+					Behavior:     "allow",
+					UpdatedInput: pending.Input,
+				}
+				slog.Info("permission allowed", "chat_id", chatID, "tool", pending.ToolName)
+			case "aa": // allow-always
+				result = &trackers.PermissionResult{
+					Behavior:     "allow-always",
+					UpdatedInput: pending.Input,
+				}
+				slog.Info("permission allowed always", "chat_id", chatID, "tool", pending.ToolName)
+			case "d": // deny
+				result = &trackers.PermissionResult{
+					Behavior: "deny",
+					Message:  "User denied permission",
+				}
+				slog.Info("permission denied", "chat_id", chatID, "tool", pending.ToolName)
+			default:
+				return "Invalid permission action"
+			}
+
+			// Send result back through the channel
+			select {
+			case pending.Response <- result:
+				// Delete the keyboard message
+				if pending.MessageID > 0 {
+					bot.DeleteMessage(chatID, pending.MessageID)
+				}
+				trackerMgr.ClearPermission(chatID)
+			default:
+				slog.Warn("permission response channel not ready", "chat_id", chatID)
+			}
+
+			return "Permission: " + result.Behavior
+		}
+
 		// Handle session selection callbacks
 		if cb.Type == "s" {
 			if cb.Action == "f" {
@@ -291,6 +436,11 @@ func main() {
 			"total_questions", len(pending.Questions),
 		)
 
+		// Delete the current keyboard message
+		if pending.MessageID > 0 {
+			bot.DeleteMessage(chatID, pending.MessageID)
+		}
+
 		// Store this answer
 		pending.Answers = append(pending.Answers, selectedOption.Label)
 		pending.CurrentIdx++
@@ -304,9 +454,12 @@ func main() {
 			// Send next question keyboard
 			nextQ := pending.Questions[nextIdx]
 			keyboard, text := telegram.BuildQuestionKeyboard(pending.ToolID, nextIdx, nextQ)
-			if err := bot.SendQuestionKeyboard(chatID, text, keyboard); err != nil {
+			msgID, err := bot.SendQuestionKeyboard(chatID, text, keyboard)
+			if err != nil {
 				slog.Error("failed to send next question keyboard", "error", err)
 			}
+			// Update message ID for next question
+			pending.MessageID = msgID
 			return "Selected: " + selectedOption.Label
 		}
 
@@ -375,6 +528,34 @@ func main() {
 			return
 		}
 		slog.Error("telegram bot error", "error", err)
+		os.Exit(1)
+	}
+}
+
+// runMCPServer runs Aria as an MCP server for permission prompts
+// This is invoked by Claude when it needs to ask for permission
+func runMCPServer() {
+	// Set up minimal logging to stderr (stdout is for MCP protocol)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// Create callback client from environment
+	client, err := mcp.NewCallbackClientFromEnv()
+	if err != nil {
+		logger.Error("failed to create callback client", "error", err)
+		os.Exit(1)
+	}
+
+	logger.Info("aria mcp server starting", "callback_port", os.Getenv(mcp.EnvCallbackPort))
+
+	// Handler calls back to parent Aria via HTTP
+	handler := func(ctx context.Context, chatID int64, toolName string, input map[string]interface{}) (*mcp.PermissionResponse, error) {
+		logger.Info("permission requested, calling parent", "tool", toolName)
+		return client.RequestPermission(ctx, toolName, input)
+	}
+
+	// Chat ID comes from env, passed to handler via closure
+	if err := mcp.RunMCPServer(0, handler, logger); err != nil {
+		logger.Error("mcp server error", "error", err)
 		os.Exit(1)
 	}
 }

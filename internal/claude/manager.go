@@ -7,11 +7,19 @@ import (
 	"sync"
 )
 
+// MCPConfig holds MCP-related configuration for permission prompts
+type MCPConfig struct {
+	ConfigPath  string                             // Path to MCP config file (or empty if using ConfigFunc)
+	ToolName    string                             // Name of the permission prompt tool
+	ConfigFunc  func(chatID int64) (string, error) // Function to get per-chat config path
+}
+
 // ProcessManager manages a pool of persistent Claude processes, one per chat
 type ProcessManager struct {
 	claudePath      string
 	debug           bool
 	skipPermissions bool
+	mcpConfig       *MCPConfig // MCP config for permission prompts (nil if skip_permissions)
 	processes       map[int64]*ClaudeProcess
 	mu              sync.RWMutex
 	logger          *slog.Logger
@@ -27,6 +35,12 @@ func NewManager(claudePath string, debug bool, skipPermissions bool, logger *slo
 		processes:       make(map[int64]*ClaudeProcess),
 		logger:          logger,
 	}
+}
+
+// SetMCPConfig sets the MCP configuration for permission prompts
+// Only used when skipPermissions is false
+func (m *ProcessManager) SetMCPConfig(cfg *MCPConfig) {
+	m.mcpConfig = cfg
 }
 
 // SetPersistence sets the session persistence handler
@@ -74,7 +88,29 @@ func (m *ProcessManager) GetOrCreate(chatID int64) (*ClaudeProcess, error) {
 
 	// Create new process (with resume if we have a persisted session)
 	m.logger.Info("creating new claude process", "chat_id", chatID, "resume", resumeSessionID != "", "cwd", cwd)
-	newProc, err := NewProcess(m.claudePath, chatID, m.debug, m.skipPermissions, resumeSessionID, cwd, m.logger)
+	opts := ProcessOptions{
+		ClaudePath:      m.claudePath,
+		ChatID:          chatID,
+		Debug:           m.debug,
+		SkipPermissions: m.skipPermissions,
+		ResumeSessionID: resumeSessionID,
+		Cwd:             cwd,
+		Logger:          m.logger,
+	}
+	if m.mcpConfig != nil {
+		// Get per-chat config if function provided, otherwise use static path
+		if m.mcpConfig.ConfigFunc != nil {
+			configPath, err := m.mcpConfig.ConfigFunc(chatID)
+			if err != nil {
+				return nil, fmt.Errorf("getting MCP config for chat %d: %w", chatID, err)
+			}
+			opts.MCPConfigPath = configPath
+		} else {
+			opts.MCPConfigPath = m.mcpConfig.ConfigPath
+		}
+		opts.PermissionToolName = m.mcpConfig.ToolName
+	}
+	newProc, err := NewProcessWithOptions(opts)
 	if err != nil {
 		return nil, fmt.Errorf("creating process for chat %d: %w", chatID, err)
 	}
@@ -110,7 +146,29 @@ func (m *ProcessManager) GetOrCreateWithSession(chatID int64, sessionID string) 
 
 	// Create new process with resume flag
 	m.logger.Info("creating claude process with session", "chat_id", chatID, "session_id", sessionID, "cwd", cwd)
-	newProc, err := NewProcess(m.claudePath, chatID, m.debug, m.skipPermissions, sessionID, cwd, m.logger)
+	opts := ProcessOptions{
+		ClaudePath:      m.claudePath,
+		ChatID:          chatID,
+		Debug:           m.debug,
+		SkipPermissions: m.skipPermissions,
+		ResumeSessionID: sessionID,
+		Cwd:             cwd,
+		Logger:          m.logger,
+	}
+	if m.mcpConfig != nil {
+		// Get per-chat config if function provided, otherwise use static path
+		if m.mcpConfig.ConfigFunc != nil {
+			configPath, err := m.mcpConfig.ConfigFunc(chatID)
+			if err != nil {
+				return nil, fmt.Errorf("getting MCP config for chat %d: %w", chatID, err)
+			}
+			opts.MCPConfigPath = configPath
+		} else {
+			opts.MCPConfigPath = m.mcpConfig.ConfigPath
+		}
+		opts.PermissionToolName = m.mcpConfig.ToolName
+	}
+	newProc, err := NewProcessWithOptions(opts)
 	if err != nil {
 		return nil, fmt.Errorf("creating process with session %s: %w", sessionID, err)
 	}
