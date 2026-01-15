@@ -457,10 +457,13 @@ func (b *Bot) TypingLoop(chatID int64) func() {
 // Also includes ARIA-specific commands handled before Claude
 var builtinCommands = []string{
 	"clear",    // Clear conversation history
+	"compact",  // Compact conversation context
 	"help",     // Show help
 	"memory",   // Edit CLAUDE.md
 	"sessions", // Switch between Claude sessions
 	"rebuild",  // Rebuild and restart ARIA
+	"exit",     // Exit for launchd restart
+	"cd",       // Change directory
 }
 
 // RegisterCommands registers slash commands with Telegram's command menu
@@ -542,9 +545,12 @@ func isValidTelegramCommand(cmd string) bool {
 func getCommandDescription(cmd string) string {
 	descriptions := map[string]string{
 		// Built-in commands
-		"clear":  "Clear conversation history",
-		"help":   "Show available commands",
-		"memory": "Edit CLAUDE.md memory file",
+		"clear":   "Clear conversation history",
+		"compact": "Compact conversation context",
+		"help":    "Show available commands",
+		"memory":  "Edit CLAUDE.md memory file",
+		"exit": "Restart ARIA via launchd",
+		"cd":   "Change working directory",
 		// Skills
 		"commit":            "Stage and commit changes",
 		"calendar":          "View and create calendar events",
@@ -557,9 +563,8 @@ func getCommandDescription(cmd string) string {
 		"gtd-clarify":       "Clarify today's tasks",
 		"things3":           "Things 3 task management",
 		"plan-to-project":   "Convert plan to Things 3 project",
-		"reflect":           "Reflect on session",
-		"browser":           "Browser automation",
-		"compact":           "Compact conversation context",
+		"reflect": "Reflect on session",
+		"browser": "Browser automation",
 	}
 
 	if desc, ok := descriptions[cmd]; ok {
