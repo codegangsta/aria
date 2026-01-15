@@ -1,4 +1,4 @@
-.PHONY: build test clean run logs
+.PHONY: build test clean run logs install uninstall restart
 
 # Build the aria binary
 build:
@@ -20,3 +20,19 @@ run: build
 # Tail the logs
 logs:
 	tail -f /tmp/aria.log
+
+# Install launchd service
+install:
+	cp com.codegangsta.aria.plist ~/Library/LaunchAgents/
+	launchctl load ~/Library/LaunchAgents/com.codegangsta.aria.plist
+
+# Uninstall launchd service
+uninstall:
+	launchctl unload ~/Library/LaunchAgents/com.codegangsta.aria.plist 2>/dev/null || true
+	rm -f ~/Library/LaunchAgents/com.codegangsta.aria.plist
+
+# Restart service (for rebuilds)
+restart:
+	launchctl stop com.codegangsta.aria 2>/dev/null || true
+	@sleep 1
+	@echo "Service restarting via launchd..."

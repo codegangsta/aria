@@ -143,6 +143,7 @@ func main() {
 	cmdRouter.Register(commands.NewCdCommand(manager, homeDir))
 	cmdRouter.Register(commands.NewSessionsCommand(sessionDiscovery, bot))
 	cmdRouter.Register(commands.NewRebuildCommand(manager, bot, sourceDir, executablePath))
+	cmdRouter.Register(commands.NewExitCommand())
 
 	// Unified tracker manager for all chat-scoped state
 	trackerMgr := trackers.NewManager(bot)
